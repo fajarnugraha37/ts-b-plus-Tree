@@ -362,3 +362,26 @@ test("diagnostics sink receives snapshots and alerts", async () => {
     expect(alerts.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+test("concurrent readers and writers", async () => {
+  await withTree(async (tree) => {
+    const writer = async (seed: number) => {
+      for (let i = 0; i < 50; i += 1) {
+        await tree.set(seed * 100 + i, bufferFromNumber(seed));
+      }
+    };
+    const reader = async () => {
+      for (let i = 0; i < 50; i += 1) {
+        await tree.get(i);
+      }
+    };
+    await Promise.all([
+      writer(1),
+      writer(2),
+      writer(3),
+      reader(),
+      reader(),
+    ]);
+    expect(tree.meta.keyCount).toBeGreaterThan(0n);
+  });
+});
