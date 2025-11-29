@@ -70,3 +70,27 @@ export function normalizeValueInput(value: Buffer): Buffer {
   value.copy(padded);
   return padded;
 }
+
+export type ValueSerializer<T> = {
+  serialize(input: T): Buffer;
+  deserialize(buffer: Buffer): T;
+};
+
+export const utf8ValueSerializer: ValueSerializer<string> = {
+  serialize(input: string): Buffer {
+    return normalizeValueInput(Buffer.from(input, "utf8"));
+  },
+  deserialize(buffer: Buffer): string {
+    return buffer.toString("utf8").replace(/\0+$/, "");
+  },
+};
+
+export const jsonValueSerializer: ValueSerializer<any> = {
+  serialize(input: unknown): Buffer {
+    return normalizeValueInput(Buffer.from(JSON.stringify(input)));
+  },
+  deserialize(buffer: Buffer): any {
+    const text = buffer.toString("utf8").replace(/\0+$/, "");
+    return JSON.parse(text || "null");
+  },
+};

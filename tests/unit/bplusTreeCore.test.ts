@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import { BPlusTree } from "../../index.ts";
 import { VALUE_SIZE_BYTES, PageType } from "../../src/constants.ts";
 import { deserializeInternal, deserializeLeaf } from "../../src/tree/pages.ts";
+import { utf8ValueSerializer, jsonValueSerializer } from "../../src/utils/codec.ts";
 
 async function withTree<T>(fn: (tree: BPlusTree) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "ts-btree-unit-"));
@@ -53,9 +54,30 @@ test("basic CRUD + range usage", async () => {
     }
     expect(rangeValues).toEqual([10, 22, 30]);
 
+    const valueStrings: string[] = [];
+    await tree.set(4, utf8ValueSerializer.serialize("ok"));
+    for await (const item of tree.values(4, 4, utf8ValueSerializer)) {
+      valueStrings.push(item);
+    }
+    expect(valueStrings).toEqual(["ok"]);
+
+    const keys: number[] = [];
+    for await (const key of tree.keys(1, 4)) {
+      keys.push(Number(key.readBigUInt64BE()));
+    }
+    expect(keys).toContain(1);
+    expect(keys).toContain(4);
+
+    await tree.set(5, jsonValueSerializer.serialize({ foo: "bar" }));
+    const jsonValues = [];
+    for await (const item of tree.values(5, 5, jsonValueSerializer)) {
+      jsonValues.push(item);
+    }
+    expect(jsonValues).toEqual([{ foo: "bar" }]);
+
     expect(await tree.delete(2)).toBeTrue();
     expect(await tree.get(2)).toBeNull();
-    expect(tree.meta.keyCount).toBe(2n);
+    expect(tree.meta.keyCount).toBe(4n);
   });
 });
 

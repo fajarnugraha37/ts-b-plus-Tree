@@ -18,6 +18,7 @@ import {
   bufferToBigInt,
   normalizeKeyInput,
   normalizeValueInput,
+  type ValueSerializer,
 } from "../utils/codec.ts";
 import type { MetaPage } from "../storage/pageManager.ts";
 import type { InternalPage, LeafPage } from "./pages.ts";
@@ -210,6 +211,26 @@ export class BPlusTree {
       }
     } finally {
       this.#releaseLeaf(leaf, false);
+    }
+  }
+
+  async *keys(startInput: KeyInput, endInput: KeyInput): AsyncGenerator<Buffer> {
+    for await (const { key } of this.range(startInput, endInput)) {
+      yield key;
+    }
+  }
+
+  async *values<T = Buffer>(
+    startInput: KeyInput,
+    endInput: KeyInput,
+    serializer?: ValueSerializer<T>,
+  ): AsyncGenerator<T> {
+    for await (const row of this.range(startInput, endInput)) {
+      if (serializer) {
+        yield serializer.deserialize(row.value);
+      } else {
+        yield row.value as unknown as T;
+      }
     }
   }
 
