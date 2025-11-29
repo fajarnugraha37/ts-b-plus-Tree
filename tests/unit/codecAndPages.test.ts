@@ -55,7 +55,7 @@ test("leaf page serialization round-trip", () => {
   expect(parsed.keyCount).toBe(2);
   expect(parsed.rightSibling).toBe(99);
   expect(parsed.cells.map((c) => c.key)).toEqual([1n, 2n]);
-  expect(parsed.cells[0].value.subarray(0, 1).toString()).toBe("a");
+  expect(parsed.cells[0]!.value.subarray(0, 1).toString()).toBe("a");
 });
 
 test("internal page serialization round-trip", () => {

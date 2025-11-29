@@ -3,7 +3,8 @@ import { mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BPlusTree } from "../../index.ts";
-import { VALUE_SIZE_BYTES } from "../../src/constants.ts";
+import { VALUE_SIZE_BYTES, PageType } from "../../src/constants.ts";
+import { deserializeInternal, deserializeLeaf } from "../../src/tree/pages.ts";
 
 async function withTree<T>(fn: (tree: BPlusTree) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "ts-btree-unit-"));
@@ -135,6 +136,114 @@ test("data persists across reopen and keeps stats sane", async () => {
       expect(value!.readUInt32LE(0)).toBe(i * 2);
     }
 
+    await reopened.close();
+  });
+});
+
+test("internal structure maintains utilization after deletes", async () => {
+  await withTree(async (tree) => {
+    let inserted = 0;
+    while (tree.meta.treeDepth < 2) {
+      for (let i = inserted; i < inserted + 256; i += 1) {
+        await tree.set(i, bufferFromNumber(i));
+      }
+      inserted += 256;
+      if (inserted > 4096) {
+        throw new Error("failed to create multi-level tree");
+      }
+    }
+    const total = inserted;
+
+    const inspectLeaves = async () => {
+      await tree.bufferPool.flushAll();
+      const leaves: Array<{ page: number; keys: number[] }> = [];
+      const pageCount = await tree.pageManager.fileManager.pageCount();
+      for (let page = 2; page < pageCount; page += 1) {
+        const buffer = await tree.pageManager.readPage(page);
+        if (buffer.readUInt8(0) !== PageType.Leaf) {
+          continue;
+        }
+        const leaf = deserializeLeaf(buffer);
+        if (leaf.cells.length === 0) {
+          continue;
+        }
+        leaves.push({ page, keys: leaf.cells.map((c) => Number(c.key)) });
+      }
+      return leaves;
+    };
+
+    const before = await inspectLeaves();
+    expect(before.length).toBeGreaterThan(0);
+    expect(before.every((leaf) => leaf.keys.length > 0)).toBeTrue();
+
+    for (let i = 0; i < total; i += 3) {
+      await tree.delete(i);
+    }
+
+    const after = await inspectLeaves();
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.every((leaf) => leaf.keys.length >= 5)).toBeTrue();
+    expect(await tree.consistencyCheck()).toBeTrue();
+  });
+});
+
+test("multi-level structure survives reopen with sorted separators", async () => {
+  await withTreePath(async (filePath) => {
+    const builder = await BPlusTree.open({ filePath });
+    const total = 1024;
+    for (let i = 0; i < total; i += 1) {
+      await builder.set(i, bufferFromNumber(i));
+    }
+    expect(builder.meta.treeDepth).toBeGreaterThanOrEqual(2);
+    await builder.close();
+
+    const reopened = await BPlusTree.open({ filePath });
+
+    const validate = async (
+      pageNumber: number,
+      depth: number,
+    ): Promise<{ min: bigint; max: bigint }> => {
+      const buffer = await reopened.pageManager.readPage(pageNumber);
+      const type = buffer.readUInt8(0);
+      if (depth === 1) {
+        expect(type).toBe(PageType.Leaf);
+        const leaf = deserializeLeaf(buffer);
+        expect(leaf.cells.length).toBeGreaterThan(0);
+        for (let i = 1; i < leaf.cells.length; i += 1) {
+          expect(leaf.cells[i].key).toBeGreaterThanOrEqual(leaf.cells[i - 1].key);
+        }
+        return {
+          min: leaf.cells[0].key,
+          max: leaf.cells[leaf.cells.length - 1].key,
+        };
+      }
+
+      expect(type).toBe(PageType.Internal);
+      const node = deserializeInternal(buffer);
+      expect(node.cells.length).toBeGreaterThan(0);
+      for (let i = 1; i < node.cells.length; i += 1) {
+        expect(node.cells[i].key).toBeGreaterThan(node.cells[i - 1].key);
+      }
+
+      const ranges: Array<{ min: bigint; max: bigint }> = [];
+      let childRange = await validate(node.leftChild, depth - 1);
+      ranges.push(childRange);
+      for (const cell of node.cells) {
+        const nextRange = await validate(cell.child, depth - 1);
+        expect(childRange.max).toBeLessThanOrEqual(cell.key);
+        ranges.push(nextRange);
+        childRange = nextRange;
+      }
+
+      return {
+        min: ranges[0].min,
+        max: ranges[ranges.length - 1].max,
+      };
+    };
+
+    const range = await validate(reopened.meta.rootPage, reopened.meta.treeDepth);
+    expect(range.min).toBe(0n);
+    expect(range.max).toBe(BigInt(total - 1));
     await reopened.close();
   });
 });
