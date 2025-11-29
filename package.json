@@ -6,10 +6,13 @@
   "scripts": {
     "test:unit": "bun test tests/unit",
     "test:integration": "bun test tests/integration",
+    "test:memory": "BPTREE_MEMORY_COUNT=10000 bun test tests/integration/memoryUsage.test.ts",
+    "test:ci": "bun x tsc --noEmit && bun test tests/unit && BPTREE_MEMORY_COUNT=10000 bun test tests/integration/memoryUsage.test.ts",
     "example:crud": "bun run examples/basicCrud.ts",
     "example:persistence": "bun run examples/persistence.ts",
     "example:scan": "bun run examples/rangeScan.ts",
-    "bench": "bun test benchmarks"
+    "bench": "bun test benchmarks",
+    "cli": "bun run tools/cli.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -18,6 +21,8 @@
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "commander": "^14.0.2"
   }
 }
-
