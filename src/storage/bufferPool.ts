@@ -12,6 +12,7 @@ interface BufferFrame {
 export interface BufferPoolOptions {
   capacity: number;
   wal?: WriteAheadLog;
+  evictionPolicy?: "LRU" | "clock";
   groupCommit?: {
     enabled: boolean;
     maxBatchPages: number;
@@ -30,6 +31,9 @@ export class BufferPool {
   readonly pageManager: PageManager;
   readonly wal?: WriteAheadLog;
   readonly groupCommit?: BufferPoolOptions["groupCommit"];
+  readonly evictionPolicy: "LRU" | "clock";
+  #clockIndex = 0;
+  #frameList: BufferFrame[] = [];
   readonly frames = new Map<number, BufferFrame>();
   #stats: BufferPoolStats = {
     pageLoads: 0,
@@ -43,6 +47,7 @@ export class BufferPool {
     this.pageManager = pageManager;
     this.wal = options.wal;
     this.groupCommit = options.groupCommit;
+    this.evictionPolicy = options.evictionPolicy ?? "LRU";
   }
 
   async getPage(pageNumber: number): Promise<Buffer> {
@@ -102,6 +107,9 @@ export class BufferPool {
   }
 
   async evictPage(): Promise<number | null> {
+    if (this.evictionPolicy === "clock") {
+      return this.#evictClock();
+    }
     let candidate: BufferFrame | null = null;
     for (const frame of this.frames.values()) {
       if (frame.pinCount > 0) {
@@ -135,6 +143,28 @@ export class BufferPool {
 
   getStats(): BufferPoolStats {
     return { ...this.#stats };
+  }
+
+  async #evictClock(): Promise<number | null> {
+    if (this.#frameList.length === 0) {
+      this.#frameList = Array.from(this.frames.values());
+    }
+    if (this.#frameList.length === 0) {
+      return null;
+    }
+    for (let scanned = 0; scanned < this.#frameList.length * 2; scanned += 1) {
+      const frame = this.#frameList[this.#clockIndex % this.#frameList.length];
+      this.#clockIndex += 1;
+      if (!frame || frame.pinCount > 0) {
+        continue;
+      }
+      await this.flushPage(frame.pageNumber);
+      this.frames.delete(frame.pageNumber);
+      this.#stats.evictions += 1;
+      this.#frameList = Array.from(this.frames.values());
+      return frame.pageNumber;
+    }
+    return null;
   }
 
   async #ensureCapacity(): Promise<void> {
