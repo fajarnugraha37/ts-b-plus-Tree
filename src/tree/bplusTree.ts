@@ -152,6 +152,7 @@ export class BPlusTree {
         const rebalanced = await this.#rebalanceLeafAfterDelete(leaf, path, leafDirty);
         currentLeaf = rebalanced.leaf;
         leafDirty = rebalanced.dirty;
+        await this.#rebalanceInternalPath(path);
       }
       if (currentLeaf) {
         this.#releaseLeaf(currentLeaf, leafDirty);
@@ -317,6 +318,259 @@ export class BPlusTree {
     return { leaf, dirty };
   }
 
+  async #rebalanceInternalPath(path: InternalPathEntry[]): Promise<void> {
+    for (let i = path.length - 1; i >= 0; i -= 1) {
+      const entry = path[i];
+      if (!entry) {
+        continue;
+      }
+      const isRoot = i === 0;
+      const minKeys = isRoot ? 1 : MIN_INTERNAL_KEYS;
+      if (entry.page.cells.length >= minKeys) {
+        continue;
+      }
+      if (isRoot) {
+        const shrunk = await this.#shrinkRootIfNeeded(path, entry);
+        if (shrunk) {
+          return;
+        }
+        continue;
+      }
+      await this.#rebalanceInternalEntry(path, i);
+    }
+  }
+
+  async #rebalanceInternalEntry(
+    path: InternalPathEntry[],
+    index: number,
+  ): Promise<void> {
+    if (index === 0) {
+      return;
+    }
+    const entry = path[index];
+    const parent = path[index - 1];
+    if (!entry || !parent) {
+      return;
+    }
+    const slot = parent.childIndex;
+    if (await this.#borrowFromLeftInternal(entry, parent, slot)) {
+      return;
+    }
+    if (await this.#borrowFromRightInternal(entry, parent, slot)) {
+      return;
+    }
+    await this.#mergeInternal(path, index, parent, slot);
+  }
+
+  async #borrowFromLeftInternal(
+    entry: InternalPathEntry,
+    parent: InternalPathEntry,
+    slot: number,
+  ): Promise<boolean> {
+    if (slot < 0) {
+      return false;
+    }
+    const leftSlot = slot - 1;
+    const leftPageNumber = this.#childPageNumber(parent.page, leftSlot);
+    if (leftPageNumber === null) {
+      return false;
+    }
+    const left = await this.#loadInternal(leftPageNumber);
+    if (left.page.cells.length <= MIN_INTERNAL_KEYS) {
+      this.#releaseInternal(left, false);
+      return false;
+    }
+    const separator = parent.page.cells[slot];
+    if (!separator) {
+      this.#releaseInternal(left, false);
+      return false;
+    }
+    const borrowed = left.page.cells.pop();
+    if (!borrowed) {
+      this.#releaseInternal(left, false);
+      return false;
+    }
+    entry.page.cells.unshift({
+      key: separator.key,
+      child: entry.page.leftChild,
+    });
+    entry.page.leftChild = borrowed.child;
+    separator.key = borrowed.key;
+    entry.dirty = true;
+    parent.dirty = true;
+    this.#releaseInternal(left, true);
+    return true;
+  }
+
+  async #borrowFromRightInternal(
+    entry: InternalPathEntry,
+    parent: InternalPathEntry,
+    slot: number,
+  ): Promise<boolean> {
+    const rightSlot = slot + 1;
+    if (rightSlot > parent.page.cells.length - 1) {
+      return false;
+    }
+    const rightPageNumber = this.#childPageNumber(parent.page, rightSlot);
+    if (rightPageNumber === null) {
+      return false;
+    }
+    const right = await this.#loadInternal(rightPageNumber);
+    if (right.page.cells.length <= MIN_INTERNAL_KEYS) {
+      this.#releaseInternal(right, false);
+      return false;
+    }
+    const separatorIndex = slot + 1;
+    const separator = parent.page.cells[separatorIndex];
+    if (!separator) {
+      this.#releaseInternal(right, false);
+      return false;
+    }
+    const shifted = right.page.cells.shift();
+    if (!shifted) {
+      this.#releaseInternal(right, false);
+      return false;
+    }
+    const movedChild = right.page.leftChild;
+    entry.page.cells.push({
+      key: separator.key,
+      child: movedChild,
+    });
+    separator.key = shifted.key;
+    right.page.leftChild = shifted.child;
+    entry.dirty = true;
+    parent.dirty = true;
+    this.#releaseInternal(right, true);
+    return true;
+  }
+
+  async #mergeInternal(
+    path: InternalPathEntry[],
+    index: number,
+    parent: InternalPathEntry,
+    slot: number,
+  ): Promise<void> {
+    const entry = path[index];
+    const parentEntry = parent;
+    if (!entry) {
+      return;
+    }
+    if (slot >= 0) {
+      const leftPageNumber = this.#childPageNumber(parent.page, slot - 1);
+      if (leftPageNumber !== null) {
+        await this.#mergeWithLeftInternal(path, index, parent, slot, leftPageNumber);
+        return;
+      }
+    }
+    const rightPageNumber = this.#childPageNumber(parent.page, slot + 1);
+    if (rightPageNumber === null) {
+      throw new Error("Internal node merge failed: no siblings available");
+    }
+    await this.#mergeWithRightInternal(path, index, parent, slot, rightPageNumber);
+  }
+
+  async #mergeWithLeftInternal(
+    path: InternalPathEntry[],
+    index: number,
+    parent: InternalPathEntry,
+    slot: number,
+    leftPageNumber: number,
+  ): Promise<void> {
+    const entry = path[index];
+    if (!entry) {
+      return;
+    }
+    const left = await this.#loadInternal(leftPageNumber);
+    const parentKeyIndex = slot;
+    const parentKey = parent.page.cells[parentKeyIndex];
+    if (!parentKey) {
+      this.#releaseInternal(left, false);
+      return;
+    }
+    left.page.cells.push({
+      key: parentKey.key,
+      child: entry.page.leftChild,
+    });
+    for (const cell of entry.page.cells) {
+      left.page.cells.push(cell);
+    }
+    left.page.rightSibling = entry.page.rightSibling;
+    this.#removeParentCell(parent, parentKeyIndex);
+    parent.childIndex = slot - 1;
+    this.bufferPool.unpin(entry.pageNumber, false);
+    this.bufferPool.dropPage(entry.pageNumber);
+    await this.pageManager.freePage(entry.pageNumber);
+    entry.pageNumber = left.pageNumber;
+    entry.buffer = left.buffer;
+    entry.page = left.page;
+    entry.dirty = true;
+  }
+
+  async #mergeWithRightInternal(
+    path: InternalPathEntry[],
+    index: number,
+    parent: InternalPathEntry,
+    slot: number,
+    rightPageNumber: number,
+  ): Promise<void> {
+    const entry = path[index];
+    if (!entry) {
+      return;
+    }
+    const right = await this.#loadInternal(rightPageNumber);
+    const parentKeyIndex = slot + 1;
+    const parentKey = parent.page.cells[parentKeyIndex];
+    if (!parentKey) {
+      this.#releaseInternal(right, false);
+      return;
+    }
+    entry.page.cells.push({
+      key: parentKey.key,
+      child: right.page.leftChild,
+    });
+    for (const cell of right.page.cells) {
+      entry.page.cells.push(cell);
+    }
+    entry.page.rightSibling = right.page.rightSibling;
+    entry.dirty = true;
+    this.#removeParentCell(parent, parentKeyIndex);
+    this.bufferPool.unpin(right.pageNumber, false);
+    this.bufferPool.dropPage(right.pageNumber);
+    await this.pageManager.freePage(right.pageNumber);
+  }
+
+  async #shrinkRootIfNeeded(
+    path: InternalPathEntry[],
+    rootEntry: InternalPathEntry,
+  ): Promise<boolean> {
+    if (this.meta.treeDepth <= 1) {
+      return false;
+    }
+    if (rootEntry.page.cells.length > 0) {
+      return false;
+    }
+    const newRootPageNumber = rootEntry.page.leftChild;
+    if (!newRootPageNumber) {
+      return false;
+    }
+    await this.#mutateMeta((meta) => {
+      meta.rootPage = newRootPageNumber;
+      meta.treeDepth -= 1;
+    });
+    this.bufferPool.unpin(rootEntry.pageNumber, false);
+    this.bufferPool.dropPage(rootEntry.pageNumber);
+    await this.pageManager.freePage(rootEntry.pageNumber);
+    if (this.meta.treeDepth === 1) {
+      path.length = 0;
+      return true;
+    }
+    const newRoot = await this.#loadInternal(newRootPageNumber);
+    rootEntry.pageNumber = newRoot.pageNumber;
+    rootEntry.buffer = newRoot.buffer;
+    rootEntry.page = newRoot.page;
+    rootEntry.dirty = false;
+    return false;
+  }
   async #splitLeaf(
     leaf: LoadedPage<LeafPage>,
   ): Promise<{ key: bigint; pageNumber: number }> {

@@ -210,11 +210,18 @@ test("multi-level structure survives reopen with sorted separators", async () =>
         const leaf = deserializeLeaf(buffer);
         expect(leaf.cells.length).toBeGreaterThan(0);
         for (let i = 1; i < leaf.cells.length; i += 1) {
-          expect(leaf.cells[i].key).toBeGreaterThanOrEqual(leaf.cells[i - 1].key);
+          const current = leaf.cells[i]!;
+          const prev = leaf.cells[i - 1]!;
+          expect(current.key).toBeGreaterThanOrEqual(prev.key);
+        }
+        const first = leaf.cells[0];
+        const last = leaf.cells[leaf.cells.length - 1];
+        if (!first || !last) {
+          throw new Error("Leaf missing boundary keys");
         }
         return {
-          min: leaf.cells[0].key,
-          max: leaf.cells[leaf.cells.length - 1].key,
+          min: first.key,
+          max: last.key,
         };
       }
 
@@ -222,7 +229,9 @@ test("multi-level structure survives reopen with sorted separators", async () =>
       const node = deserializeInternal(buffer);
       expect(node.cells.length).toBeGreaterThan(0);
       for (let i = 1; i < node.cells.length; i += 1) {
-        expect(node.cells[i].key).toBeGreaterThan(node.cells[i - 1].key);
+        const current = node.cells[i]!;
+        const prev = node.cells[i - 1]!;
+        expect(current.key).toBeGreaterThan(prev.key);
       }
 
       const ranges: Array<{ min: bigint; max: bigint }> = [];
@@ -235,9 +244,14 @@ test("multi-level structure survives reopen with sorted separators", async () =>
         childRange = nextRange;
       }
 
+      const firstRange = ranges[0];
+      const lastRange = ranges[ranges.length - 1];
+      if (!firstRange || !lastRange) {
+        throw new Error("Invalid range aggregation");
+      }
       return {
-        min: ranges[0].min,
-        max: ranges[ranges.length - 1].max,
+        min: firstRange.min,
+        max: lastRange.max,
       };
     };
 
