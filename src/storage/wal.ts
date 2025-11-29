@@ -1,4 +1,4 @@
-import { open } from "fs/promises";
+import { open, stat } from "fs/promises";
 import type { FileHandle } from "fs/promises";
 import type { PageManager } from "./pageManager.ts";
 
@@ -61,7 +61,7 @@ export class WriteAheadLog {
     });
   }
 
-  async commitTransaction(txId: number): Promise<void> {
+  async commitTransaction(txId: number, skipSync = false): Promise<void> {
     const frames = this.#pending.get(txId);
     if (!frames) {
       return;
@@ -71,7 +71,9 @@ export class WriteAheadLog {
       await this.#writeRecord(RecordType.Page, txId, frame.pageNumber, frame.data);
     }
     await this.#writeRecord(RecordType.Commit, txId, 0, Buffer.alloc(0));
-    await this.#handle!.sync();
+    if (!skipSync) {
+      await this.#handle!.sync();
+    }
     this.#pending.delete(txId);
   }
 

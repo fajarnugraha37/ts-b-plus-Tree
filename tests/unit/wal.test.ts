@@ -69,3 +69,41 @@ test("checkpoint truncates WAL file", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("WAL recovers after simulated crash mid-commit", async () => {
+  const { dir, pageManager, walPath } = await setupEnv();
+  try {
+    const wal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+    await wal.open();
+    const tx = await wal.beginTransaction();
+    await wal.writePage(tx, 4, Buffer.alloc(PAGE_SIZE_BYTES, 0x44));
+    // simulate crash by not committing and closing abruptly
+    await wal.close();
+
+    const crashWal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+    await crashWal.open();
+    const replayBefore = await pageManager.readPage(4);
+    expect(replayBefore).toEqual(Buffer.alloc(PAGE_SIZE_BYTES));
+    await crashWal.replay(pageManager);
+
+    const afterReplay = await pageManager.readPage(4);
+    expect(afterReplay.equals(Buffer.alloc(PAGE_SIZE_BYTES))).toBeTrue();
+
+    const wal2 = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+    await wal2.open();
+    const tx2 = await wal2.beginTransaction();
+    const payload = Buffer.alloc(PAGE_SIZE_BYTES, 0x55);
+    await wal2.writePage(tx2, 4, payload);
+    await wal2.commitTransaction(tx2, true); // skip sync to simulate buffered commit
+    await wal2.close();
+
+    const recoveryWal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+    await recoveryWal.open();
+    await recoveryWal.replay(pageManager);
+
+    const finalPage = await pageManager.readPage(4);
+    expect(finalPage.equals(payload)).toBeTrue();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

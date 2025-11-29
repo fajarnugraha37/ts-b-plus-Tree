@@ -30,6 +30,10 @@ interface BPlusTreeOptions {
   filePath: string;
   walPath?: string;
   bufferPages?: number;
+  walOptions?: {
+    groupCommit?: boolean;
+    checkpointIntervalOps?: number;
+  };
 }
 
 export class BPlusTree {
@@ -37,17 +41,21 @@ export class BPlusTree {
   readonly bufferPool: BufferPool;
   readonly wal: WriteAheadLog;
   meta: MetaPage;
+  #checkpointIntervalOps: number;
+  #opsSinceCheckpoint = 0;
 
   private constructor(
     pageManager: PageManager,
     bufferPool: BufferPool,
     wal: WriteAheadLog,
     meta: MetaPage,
+    walOptions?: BPlusTreeOptions["walOptions"],
   ) {
     this.pageManager = pageManager;
     this.bufferPool = bufferPool;
     this.wal = wal;
     this.meta = meta;
+    this.#checkpointIntervalOps = walOptions?.checkpointIntervalOps ?? 0;
   }
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
@@ -61,9 +69,12 @@ export class BPlusTree {
     const bufferPool = new BufferPool(pageManager, {
       capacity: options.bufferPages ?? BUFFER_POOL_PAGES,
       wal,
+      groupCommit: options.walOptions?.groupCommit
+        ? { enabled: true, maxBatchPages: 8 }
+        : undefined,
     });
     const meta = await pageManager.readMeta();
-    return new BPlusTree(pageManager, bufferPool, wal, meta);
+    return new BPlusTree(pageManager, bufferPool, wal, meta, options.walOptions);
   }
 
   async close(): Promise<void> {
@@ -120,6 +131,7 @@ export class BPlusTree {
       await this.#mutateMeta((meta) => {
         meta.keyCount += 1n;
       });
+      await this.#maybeCheckpoint();
     } finally {
       for (const entry of path) {
         this.#releaseInternal(entry, entry.dirty);
@@ -151,6 +163,7 @@ export class BPlusTree {
         currentLeaf = rebalanced.leaf;
         leafDirty = rebalanced.dirty;
         await rebalanceInternalPath(this.#internalContext(), path);
+        await this.#maybeCheckpoint();
       }
       if (currentLeaf) {
         this.#releaseLeaf(currentLeaf, leafDirty);
@@ -557,5 +570,17 @@ export class BPlusTree {
       releaseInternal: (page, dirty) => this.#releaseInternal(page, dirty),
       dropPage: (pageNumber) => this.bufferPool.dropPage(pageNumber),
     };
+  }
+
+  async #maybeCheckpoint(): Promise<void> {
+    if (this.#checkpointIntervalOps <= 0) {
+      return;
+    }
+    this.#opsSinceCheckpoint += 1;
+    if (this.#opsSinceCheckpoint >= this.#checkpointIntervalOps) {
+      await this.bufferPool.flushAll();
+      await this.wal.checkpoint(this.pageManager);
+      this.#opsSinceCheckpoint = 0;
+    }
   }
 }

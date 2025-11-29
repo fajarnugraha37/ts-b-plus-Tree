@@ -12,6 +12,10 @@ interface BufferFrame {
 export interface BufferPoolOptions {
   capacity: number;
   wal?: WriteAheadLog;
+  groupCommit?: {
+    enabled: boolean;
+    maxBatchPages: number;
+  };
 }
 
 export interface BufferPoolStats {
@@ -25,6 +29,7 @@ export class BufferPool {
   readonly capacity: number;
   readonly pageManager: PageManager;
   readonly wal?: WriteAheadLog;
+  readonly groupCommit?: BufferPoolOptions["groupCommit"];
   readonly frames = new Map<number, BufferFrame>();
   #stats: BufferPoolStats = {
     pageLoads: 0,
@@ -37,6 +42,7 @@ export class BufferPool {
     this.capacity = options.capacity;
     this.pageManager = pageManager;
     this.wal = options.wal;
+    this.groupCommit = options.groupCommit;
   }
 
   async getPage(pageNumber: number): Promise<Buffer> {
@@ -82,7 +88,7 @@ export class BufferPool {
     if (this.wal) {
       const txId = await this.wal.beginTransaction();
       await this.wal.writePage(txId, pageNumber, walData);
-      await this.wal.commitTransaction(txId);
+      await this.wal.commitTransaction(txId, this.groupCommit?.enabled ?? false);
     }
     await this.pageManager.writePage(pageNumber, frame.buffer);
     frame.dirty = false;
