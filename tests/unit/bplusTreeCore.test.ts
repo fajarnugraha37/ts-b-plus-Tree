@@ -6,6 +6,7 @@ import { BPlusTree } from "../../index.ts";
 import { VALUE_SIZE_BYTES, PageType } from "../../src/constants.ts";
 import { deserializeInternal, deserializeLeaf } from "../../src/tree/pages.ts";
 import { utf8ValueSerializer, jsonValueSerializer } from "../../src/utils/codec.ts";
+import type { DiagnosticsSnapshot } from "../../src/diagnostics.ts";
 
 async function withTree<T>(fn: (tree: BPlusTree) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "ts-btree-unit-"));
@@ -339,5 +340,25 @@ test("internal node redistribution keeps separators consistent", async () => {
       expect(node.keys.length).toBeGreaterThan(0);
     }
     expect(await tree.consistencyCheck()).toBeTrue();
+  });
+});
+
+test("diagnostics sink receives snapshots and alerts", async () => {
+  await withTreePath(async (filePath) => {
+    const snapshots: DiagnosticsSnapshot[] = [];
+    const alerts: string[] = [];
+    const diagTree = await BPlusTree.open({
+      filePath,
+      diagnostics: {
+        onSnapshot: (snap) => snapshots.push(snap),
+        onAlert: (msg) => alerts.push(msg),
+      },
+      limits: { rssBytes: 1 }, // force alert
+    });
+    await diagTree.set(1, bufferFromNumber(1));
+    await diagTree.delete(1);
+    await diagTree.close();
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
   });
 });

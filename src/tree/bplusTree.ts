@@ -26,6 +26,7 @@ import type { KeyInput } from "../utils/codec.ts";
 import type { InternalPathEntry, LoadedPage } from "./types.ts";
 import type { InternalRebalanceContext } from "./internalRebalancer.ts";
 import { rebalanceInternalPath } from "./internalRebalancer.ts";
+import type { DiagnosticsSink } from "../diagnostics.ts";
 
 interface BPlusTreeOptions {
   filePath: string;
@@ -34,6 +35,11 @@ interface BPlusTreeOptions {
   walOptions?: {
     groupCommit?: boolean;
     checkpointIntervalOps?: number;
+  };
+  diagnostics?: DiagnosticsSink;
+  limits?: {
+    rssBytes?: number;
+    bufferPages?: number;
   };
 }
 
@@ -44,6 +50,9 @@ export class BPlusTree {
   meta: MetaPage;
   #checkpointIntervalOps: number;
   #opsSinceCheckpoint = 0;
+  #diagnostics?: DiagnosticsSink;
+  #rssLimit: number;
+  #bufferPageLimit?: number;
 
   private constructor(
     pageManager: PageManager,
@@ -51,12 +60,17 @@ export class BPlusTree {
     wal: WriteAheadLog,
     meta: MetaPage,
     walOptions?: BPlusTreeOptions["walOptions"],
+    diagnostics?: DiagnosticsSink,
+    limits?: BPlusTreeOptions["limits"],
   ) {
     this.pageManager = pageManager;
     this.bufferPool = bufferPool;
     this.wal = wal;
     this.meta = meta;
     this.#checkpointIntervalOps = walOptions?.checkpointIntervalOps ?? 0;
+    this.#diagnostics = diagnostics;
+    this.#rssLimit = limits?.rssBytes ?? 100 * 1024 * 1024;
+    this.#bufferPageLimit = limits?.bufferPages;
   }
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
@@ -75,7 +89,15 @@ export class BPlusTree {
         : undefined,
     });
     const meta = await pageManager.readMeta();
-    return new BPlusTree(pageManager, bufferPool, wal, meta, options.walOptions);
+    return new BPlusTree(
+      pageManager,
+      bufferPool,
+      wal,
+      meta,
+      options.walOptions,
+      options.diagnostics,
+      options.limits,
+    );
   }
 
   async close(): Promise<void> {
@@ -84,6 +106,7 @@ export class BPlusTree {
     await this.wal.close();
     await this.pageManager.fileManager.sync();
     await this.pageManager.fileManager.close();
+    await this.#emitDiagnostics("close");
   }
 
   async get(keyInput: KeyInput): Promise<Buffer | null> {
@@ -133,6 +156,7 @@ export class BPlusTree {
         meta.keyCount += 1n;
       });
       await this.#maybeCheckpoint();
+      await this.#emitDiagnostics("set");
     } finally {
       for (const entry of path) {
         this.#releaseInternal(entry, entry.dirty);
@@ -165,6 +189,7 @@ export class BPlusTree {
         leafDirty = rebalanced.dirty;
         await rebalanceInternalPath(this.#internalContext(), path);
         await this.#maybeCheckpoint();
+        await this.#emitDiagnostics("delete");
       }
       if (currentLeaf) {
         this.#releaseLeaf(currentLeaf, leafDirty);
@@ -602,6 +627,38 @@ export class BPlusTree {
       await this.bufferPool.flushAll();
       await this.wal.checkpoint(this.pageManager);
       this.#opsSinceCheckpoint = 0;
+    }
+  }
+
+  async #emitDiagnostics(reason: string): Promise<void> {
+    if (!this.#diagnostics) {
+      return;
+    }
+    const bufferStats = this.bufferPool.getStats();
+    const walStats = this.wal.getStats();
+    const mem = process.memoryUsage();
+    const snapshot = {
+      bufferPool: bufferStats,
+      wal: walStats,
+      rssBytes: mem.rss,
+      heapUsedBytes: mem.heapUsed,
+      reason,
+    };
+    this.#diagnostics.onSnapshot?.(snapshot);
+    if (mem.rss > this.#rssLimit) {
+      this.#diagnostics.onAlert?.(
+        `RSS ${mem.rss} exceeds limit ${this.#rssLimit}`,
+        snapshot,
+      );
+    }
+    if (
+      this.#bufferPageLimit &&
+      bufferStats.maxResidentPages > this.#bufferPageLimit
+    ) {
+      this.#diagnostics.onAlert?.(
+        `Buffer pages ${bufferStats.maxResidentPages} exceeded limit ${this.#bufferPageLimit}`,
+        snapshot,
+      );
     }
   }
 }

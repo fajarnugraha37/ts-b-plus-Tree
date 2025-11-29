@@ -16,12 +16,19 @@ interface PendingFrame {
   data: Buffer;
 }
 
+export interface WalStats {
+  framesWritten: number;
+  commits: number;
+  pendingTransactions: number;
+}
+
 export class WriteAheadLog {
   readonly walPath: string;
   readonly pageSize: number;
   #handle: FileHandle | null = null;
   #nextTxId = 1;
   #pending = new Map<number, PendingFrame[]>();
+  #stats: WalStats = { framesWritten: 0, commits: 0, pendingTransactions: 0 };
 
   constructor(walPath: string, pageSize: number) {
     this.walPath = walPath;
@@ -44,6 +51,7 @@ export class WriteAheadLog {
     await this.open();
     const txId = this.#nextTxId++;
     this.#pending.set(txId, []);
+    this.#stats.pendingTransactions = this.#pending.size;
     return txId;
   }
 
@@ -69,16 +77,20 @@ export class WriteAheadLog {
     await this.#ensureHeader();
     for (const frame of frames) {
       await this.#writeRecord(RecordType.Page, txId, frame.pageNumber, frame.data);
+      this.#stats.framesWritten += 1;
     }
     await this.#writeRecord(RecordType.Commit, txId, 0, Buffer.alloc(0));
     if (!skipSync) {
       await this.#handle!.sync();
     }
     this.#pending.delete(txId);
+    this.#stats.pendingTransactions = this.#pending.size;
+    this.#stats.commits += 1;
   }
 
   rollbackTransaction(txId: number): void {
     this.#pending.delete(txId);
+    this.#stats.pendingTransactions = this.#pending.size;
   }
 
   async replay(pageManager: PageManager): Promise<void> {
@@ -151,6 +163,10 @@ export class WriteAheadLog {
     await this.open();
     await this.#handle!.truncate(HEADER_SIZE);
     await this.#handle!.sync();
+  }
+
+  getStats(): WalStats {
+    return { ...this.#stats };
   }
 
   async #writeRecord(
