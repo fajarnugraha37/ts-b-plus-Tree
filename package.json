@@ -1,0 +1,23 @@
+{
+  "name": "ts-btree",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test:unit": "bun test tests/unit",
+    "test:integration": "bun test tests/integration",
+    "example:crud": "bun run examples/basicCrud.ts",
+    "example:persistence": "bun run examples/persistence.ts",
+    "example:scan": "bun run examples/rangeScan.ts",
+    "bench": "bun test benchmarks"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
+
