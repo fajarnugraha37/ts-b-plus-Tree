@@ -1,3 +1,4 @@
+import { appendFile } from "fs/promises";
 import type { BufferPoolStats } from "./storage/bufferPool.ts";
 import type { WalStats } from "./storage/wal.ts";
 
@@ -31,5 +32,23 @@ export class ConsoleDiagnosticsSink implements DiagnosticsSink {
       bufferFlushes: snapshot.bufferPool.pageFlushes,
       walFrames: snapshot.wal.framesWritten,
     });
+  }
+}
+
+export class FileDiagnosticsSink implements DiagnosticsSink {
+  constructor(private readonly filePath: string) {}
+
+  async onSnapshot(snapshot: DiagnosticsSnapshot): Promise<void> {
+    await appendFile(
+      this.filePath,
+      JSON.stringify({ type: "snapshot", ...snapshot }) + "\n",
+    );
+  }
+
+  async onAlert(message: string, snapshot: DiagnosticsSnapshot): Promise<void> {
+    await appendFile(
+      this.filePath,
+      JSON.stringify({ type: "alert", message, ...snapshot }) + "\n",
+    );
   }
 }
