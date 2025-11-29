@@ -5,6 +5,9 @@ import {
   MIN_LEAF_KEYS,
   PageType,
   MAGIC,
+  KEY_SIZE_BYTES,
+  PAGE_HEADER_SIZE,
+  OVERFLOW_HEADER_SIZE,
 } from "../constants.ts";
 import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
@@ -22,7 +25,7 @@ import {
   type ValueSerializer,
 } from "../utils/codec.ts";
 import type { MetaPage } from "../storage/pageManager.ts";
-import type { InternalPage, LeafPage } from "./pages.ts";
+import type { InternalPage, LeafPage, LeafCell } from "./pages.ts";
 import type { KeyInput } from "../utils/codec.ts";
 import type { InternalPathEntry, LoadedPage } from "./types.ts";
 import type { InternalRebalanceContext } from "./internalRebalancer.ts";
@@ -131,7 +134,7 @@ export class BPlusTree {
         if (index < 0) {
           return null;
         }
-        return Buffer.from(leaf.page.cells[index]!.value);
+        return await this.#materializeCellValue(leaf.page.cells[index]!);
       } finally {
         this.#releaseLeaf(leaf, false);
       }
@@ -167,7 +170,10 @@ export class BPlusTree {
       try {
         const idx = leaf.page.cells.findIndex((cell) => cell.key === key);
         if (idx >= 0) {
-          leaf.page.cells.splice(idx, 1);
+          const [removed] = leaf.page.cells.splice(idx, 1);
+          if (removed) {
+            await this.#freeOverflowChain(removed.overflowPage);
+          }
           deleted = true;
           leafDirty = true;
           const parent = path[path.length - 1];
@@ -220,9 +226,10 @@ export class BPlusTree {
             if (cell.key > endKey) {
               return;
             }
+            const value = await this.#materializeCellValue(cell);
             yield {
               key: Buffer.from(normalizeKeyInput(cell.key)),
-              value: Buffer.from(cell.value),
+              value,
             };
           }
           if (!leaf.page.rightSibling) {
@@ -360,10 +367,17 @@ export class BPlusTree {
       if (leftLeaf.page.cells.length > MIN_LEAF_KEYS) {
         const borrowed = leftLeaf.page.cells.pop();
         if (borrowed) {
-          leaf.page.cells.unshift(borrowed);
-          this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
-          this.#releaseLeaf(leftLeaf, true);
-          return { leaf, dirty: true };
+          const candidateSize = this.#leafSerializedSize([
+            borrowed,
+            ...leaf.page.cells,
+          ]);
+          if (candidateSize <= this.pageManager.pageSize) {
+            leaf.page.cells.unshift(borrowed);
+            this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
+            this.#releaseLeaf(leftLeaf, true);
+            return { leaf, dirty: true };
+          }
+          leftLeaf.page.cells.push(borrowed);
         }
       }
       this.#releaseLeaf(leftLeaf, false);
@@ -376,11 +390,18 @@ export class BPlusTree {
       if (rightLeaf.page.cells.length > MIN_LEAF_KEYS) {
         const borrowed = rightLeaf.page.cells.shift();
         if (borrowed) {
-          leaf.page.cells.push(borrowed);
-          this.#updateParentKeyForLeaf(parent, rightSlot, rightLeaf.page);
-          this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
-          this.#releaseLeaf(rightLeaf, true);
-          return { leaf, dirty: true };
+          const candidateSize = this.#leafSerializedSize([
+            ...leaf.page.cells,
+            borrowed,
+          ]);
+          if (candidateSize <= this.pageManager.pageSize) {
+            leaf.page.cells.push(borrowed);
+            this.#updateParentKeyForLeaf(parent, rightSlot, rightLeaf.page);
+            this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
+            this.#releaseLeaf(rightLeaf, true);
+            return { leaf, dirty: true };
+          }
+          rightLeaf.page.cells.unshift(borrowed);
         }
       }
       this.#releaseLeaf(rightLeaf, false);
@@ -388,27 +409,41 @@ export class BPlusTree {
 
     if (leftPageNumber !== null) {
       const leftLeaf = await this.#loadLeaf(leftPageNumber);
-      leftLeaf.page.cells.push(...leaf.page.cells);
-      leftLeaf.page.rightSibling = leaf.page.rightSibling;
-      this.bufferPool.unpin(leaf.pageNumber, false);
-      this.bufferPool.dropPage(leaf.pageNumber);
-      await this.pageManager.freePage(leaf.pageNumber);
-      this.#removeParentCell(parent, parent.childIndex);
-      parent.childIndex = leftSlot;
-      this.#updateParentKeyForLeaf(parent, leftSlot, leftLeaf.page);
-      return { leaf: leftLeaf, dirty: true };
+      const mergedSize = this.#leafSerializedSize([
+        ...leftLeaf.page.cells,
+        ...leaf.page.cells,
+      ]);
+      if (mergedSize <= this.pageManager.pageSize) {
+        leftLeaf.page.cells.push(...leaf.page.cells);
+        leftLeaf.page.rightSibling = leaf.page.rightSibling;
+        this.bufferPool.unpin(leaf.pageNumber, false);
+        this.bufferPool.dropPage(leaf.pageNumber);
+        await this.pageManager.freePage(leaf.pageNumber);
+        this.#removeParentCell(parent, parent.childIndex);
+        parent.childIndex = leftSlot;
+        this.#updateParentKeyForLeaf(parent, leftSlot, leftLeaf.page);
+        return { leaf: leftLeaf, dirty: true };
+      }
+      this.#releaseLeaf(leftLeaf, false);
     }
 
     if (rightPageNumber !== null) {
       const rightLeaf = await this.#loadLeaf(rightPageNumber);
-      leaf.page.cells.push(...rightLeaf.page.cells);
-      leaf.page.rightSibling = rightLeaf.page.rightSibling;
-      this.bufferPool.unpin(rightLeaf.pageNumber, false);
-      this.bufferPool.dropPage(rightLeaf.pageNumber);
-      await this.pageManager.freePage(rightLeaf.pageNumber);
-      this.#removeParentCell(parent, rightSlot);
-      this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
-      return { leaf, dirty: true };
+      const mergedSize = this.#leafSerializedSize([
+        ...leaf.page.cells,
+        ...rightLeaf.page.cells,
+      ]);
+      if (mergedSize <= this.pageManager.pageSize) {
+        leaf.page.cells.push(...rightLeaf.page.cells);
+        leaf.page.rightSibling = rightLeaf.page.rightSibling;
+        this.bufferPool.unpin(rightLeaf.pageNumber, false);
+        this.bufferPool.dropPage(rightLeaf.pageNumber);
+        await this.pageManager.freePage(rightLeaf.pageNumber);
+        this.#removeParentCell(parent, rightSlot);
+        this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
+        return { leaf, dirty: true };
+      }
+      this.#releaseLeaf(rightLeaf, false);
     }
 
     return { leaf, dirty };
@@ -417,8 +452,22 @@ export class BPlusTree {
   async #splitLeaf(
     leaf: LoadedPage<LeafPage>,
   ): Promise<{ key: bigint; pageNumber: number }> {
-    const midpoint = Math.ceil(leaf.page.cells.length / 2);
-    const siblingCells = leaf.page.cells.splice(midpoint);
+    const totalSize = this.#leafSerializedSize(leaf.page.cells);
+    const targetSize = totalSize / 2;
+    let accumulated = PAGE_HEADER_SIZE;
+    let splitIndex = 0;
+    for (; splitIndex < leaf.page.cells.length - 1; splitIndex += 1) {
+      const cell = leaf.page.cells[splitIndex];
+      if (!cell) {
+        break;
+      }
+      const cellSize = this.#leafCellSerializedSize(cell);
+      if (accumulated + cellSize >= targetSize) {
+        break;
+      }
+      accumulated += cellSize;
+    }
+    const siblingCells = leaf.page.cells.splice(splitIndex + 1);
     const siblingPageNumber = await this.pageManager.allocatePage();
     const siblingBuffer = await this.bufferPool.getPage(siblingPageNumber);
     const siblingPage: LeafPage = {
@@ -507,16 +556,16 @@ export class BPlusTree {
     return { key: promote.key, pageNumber: rightPageNumber };
   }
 
-  #insertIntoLeaf(page: LeafPage, key: bigint, value: Buffer): number {
+  #insertIntoLeaf(page: LeafPage, cell: LeafCell): number {
     let idx = 0;
     while (idx < page.cells.length) {
-      const cell = page.cells[idx];
-      if (!cell || cell.key >= key) {
+      const existing = page.cells[idx];
+      if (!existing || existing.key >= cell.key) {
         break;
       }
       idx += 1;
     }
-    page.cells.splice(idx, 0, { key, value });
+    page.cells.splice(idx, 0, cell);
     return idx;
   }
 
@@ -537,12 +586,19 @@ export class BPlusTree {
     try {
       const existingIndex = leaf.page.cells.findIndex((cell) => cell.key === key);
       if (existingIndex >= 0) {
-        leaf.page.cells[existingIndex] = { key, value: normalizedValue };
+        const previous = leaf.page.cells[existingIndex];
+        if (previous) {
+          await this.#freeOverflowChain(previous.overflowPage);
+        }
+        leaf.page.cells[existingIndex] = await this.#prepareLeafCell(key, normalizedValue);
         this.#releaseLeaf(leaf, true);
         return;
       }
 
-      const insertIndex = this.#insertIntoLeaf(leaf.page, key, normalizedValue);
+      const insertIndex = this.#insertIntoLeaf(
+        leaf.page,
+        await this.#prepareLeafCell(key, normalizedValue),
+      );
       if (insertIndex === 0) {
         const parent = path[path.length - 1];
         if (parent) {
@@ -550,7 +606,7 @@ export class BPlusTree {
         }
       }
 
-      while (leaf.page.cells.length > MAX_LEAF_KEYS) {
+      while (this.#leafSerializedSize(leaf.page.cells) > this.pageManager.pageSize) {
         const split = await this.#splitLeaf(leaf);
         await this.#propagateSplit(path, split.key, split.pageNumber);
       }
@@ -691,9 +747,10 @@ export class BPlusTree {
     try {
       while (true) {
         for (const cell of leaf.page.cells) {
+          const value = await this.#materializeCellValue(cell);
           entries.push({
             key: Buffer.from(normalizeKeyInput(cell.key)),
-            value: Buffer.from(cell.value),
+            value,
           });
         }
         if (!leaf.page.rightSibling) {
@@ -747,6 +804,120 @@ export class BPlusTree {
       await this.wal.checkpoint(this.pageManager);
       this.#opsSinceCheckpoint = 0;
     }
+  }
+
+  #leafCellSerializedSize(cell: LeafCell): number {
+    return 12 + KEY_SIZE_BYTES + cell.inlineValue.length;
+  }
+
+  #leafSerializedSize(cells: LeafCell[]): number {
+    let size = PAGE_HEADER_SIZE + cells.length * 2;
+    for (const cell of cells) {
+      size += 12 + KEY_SIZE_BYTES + cell.inlineValue.length;
+    }
+    return size;
+  }
+
+  async #prepareLeafCell(key: bigint, value: Buffer): Promise<LeafCell> {
+    const inlineLimit = this.#maxInlineValueBytes();
+    const inlineLength = Math.min(value.length, inlineLimit);
+    const inlineValue = Buffer.from(value.subarray(0, inlineLength));
+    const remainder = value.subarray(inlineLength);
+    let overflowPage = 0;
+    if (remainder.length > 0) {
+      overflowPage = await this.#writeOverflowChain(remainder);
+    }
+    return {
+      key,
+      inlineValue,
+      valueLength: value.length,
+      overflowPage,
+    };
+  }
+
+  async #materializeCellValue(cell: LeafCell): Promise<Buffer> {
+    if (cell.overflowPage === 0) {
+      return Buffer.from(cell.inlineValue);
+    }
+    const buffer = Buffer.alloc(cell.valueLength);
+    cell.inlineValue.copy(buffer);
+    let offset = cell.inlineValue.length;
+    let cursor = cell.overflowPage;
+    while (cursor !== 0 && offset < cell.valueLength) {
+      const pageBuffer = await this.bufferPool.getPage(cursor);
+      if (pageBuffer.readUInt8(0) !== PageType.Overflow) {
+        this.bufferPool.unpin(cursor, false);
+        throw new Error(`Page ${cursor} is not an overflow page`);
+      }
+      const chunkLength = pageBuffer.readUInt32LE(8);
+      const copyLength = Math.min(chunkLength, cell.valueLength - offset);
+      pageBuffer.copy(
+        buffer,
+        offset,
+        OVERFLOW_HEADER_SIZE,
+        OVERFLOW_HEADER_SIZE + copyLength,
+      );
+      offset += copyLength;
+      const next = pageBuffer.readUInt32LE(4);
+      this.bufferPool.unpin(cursor, false);
+      cursor = next;
+    }
+    if (offset !== cell.valueLength) {
+      throw new Error(`Overflow chain truncated for key ${cell.key}`);
+    }
+    return buffer;
+  }
+
+  async #writeOverflowChain(data: Buffer): Promise<number> {
+    if (data.length === 0) {
+      return 0;
+    }
+    const payloadSize = this.pageManager.pageSize - OVERFLOW_HEADER_SIZE;
+    let head = 0;
+    let lastPage = 0;
+    let lastBuffer: Buffer | null = null;
+    let offset = 0;
+    while (offset < data.length) {
+      const pageNumber = await this.pageManager.allocatePage();
+      const buffer = await this.bufferPool.getPage(pageNumber);
+      buffer.fill(0);
+      buffer.writeUInt8(PageType.Overflow, 0);
+      buffer.writeUInt32LE(0, 4);
+      const chunkLength = Math.min(payloadSize, data.length - offset);
+      buffer.writeUInt32LE(chunkLength >>> 0, 8);
+      data.copy(buffer, OVERFLOW_HEADER_SIZE, offset, offset + chunkLength);
+      if (head === 0) {
+        head = pageNumber;
+      }
+      if (lastBuffer && lastPage !== 0) {
+        lastBuffer.writeUInt32LE(pageNumber, 4);
+        this.bufferPool.unpin(lastPage, true);
+      }
+      lastBuffer = buffer;
+      lastPage = pageNumber;
+      offset += chunkLength;
+    }
+    if (lastBuffer && lastPage !== 0) {
+      this.bufferPool.unpin(lastPage, true);
+    }
+    return head;
+  }
+
+  async #freeOverflowChain(pageNumber: number): Promise<void> {
+    let cursor = pageNumber;
+    while (cursor !== 0) {
+      const buffer = await this.bufferPool.getPage(cursor);
+      const next = buffer.readUInt32LE(4);
+      this.bufferPool.unpin(cursor, false);
+      this.bufferPool.dropPage(cursor);
+      await this.pageManager.freePage(cursor);
+      cursor = next;
+    }
+  }
+
+  #maxInlineValueBytes(): number {
+    const overhead = PAGE_HEADER_SIZE + 2 + KEY_SIZE_BYTES + 12;
+    return Math.max(0, this.pageManager.pageSize - overhead);
   }
 
   async #emitDiagnostics(reason: string): Promise<void> {

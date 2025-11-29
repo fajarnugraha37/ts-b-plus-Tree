@@ -3,13 +3,13 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { mkdtemp, rm } from "fs/promises";
 import { BPlusTree } from "../../index.ts";
-import { VALUE_SIZE_BYTES } from "../../src/constants.ts";
 
 const DEFAULT_COUNT = 1_000_000;
 const recordCount = Number(process.env.BPTREE_STRESS_COUNT ?? DEFAULT_COUNT);
+const VALUE_BYTES = 128;
 
 function makeValue(key: number): Buffer {
-  const buffer = Buffer.alloc(VALUE_SIZE_BYTES);
+  const buffer = Buffer.alloc(VALUE_BYTES);
   buffer.writeUInt32LE(key, 0);
   return buffer;
 }

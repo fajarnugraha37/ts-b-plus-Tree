@@ -3,14 +3,14 @@ import { mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BPlusTree } from "../../index.ts";
-import { VALUE_SIZE_BYTES } from "../../src/constants.ts";
 
 const DEFAULT_COUNT = 1_000_000;
 const recordCount = Number(process.env.BPTREE_BENCH_COUNT ?? DEFAULT_COUNT);
 const checkpointStride = Math.max(1, Math.floor(recordCount / 100));
+const VALUE_BYTES = 128;
 
 function makeValue(n: number): Buffer {
-  const buffer = Buffer.alloc(VALUE_SIZE_BYTES);
+  const buffer = Buffer.alloc(VALUE_BYTES);
   buffer.writeUInt32LE(n, 0);
   return buffer;
 }

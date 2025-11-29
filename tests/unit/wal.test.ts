@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, stat } from "fs/promises";
+import { mkdtemp, rm, stat, open } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { PageManager } from "../../src/storage/pageManager.ts";
@@ -103,6 +103,67 @@ test("WAL recovers after simulated crash mid-commit", async () => {
 
     const finalPage = await pageManager.readPage(4);
     expect(finalPage.equals(payload)).toBeTrue();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("WAL emits begin records before frames", async () => {
+  const { dir, wal, walPath } = await setupEnv();
+  try {
+    const tx = await wal.beginTransaction();
+    const payload = Buffer.alloc(PAGE_SIZE_BYTES, 0x77);
+    await wal.writePage(tx, 9, payload);
+    await wal.commitTransaction(tx);
+    await wal.close();
+
+    const handle = await open(walPath, "r");
+    try {
+      const header = Buffer.alloc(20);
+      await handle.read(header, 0, 20, 32);
+      expect(header.readUInt32LE(0)).toBe(0); // Begin record type
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("WAL replay ignores torn frames at EOF", async () => {
+  const { dir, pageManager, wal, walPath } = await setupEnv();
+  try {
+    const tx = await wal.beginTransaction();
+    const payload = Buffer.alloc(PAGE_SIZE_BYTES, 0x88);
+    await wal.writePage(tx, 11, payload);
+    await wal.commitTransaction(tx);
+    await wal.close();
+
+    const handle = await open(walPath, "r+");
+    try {
+      const stats = await handle.stat();
+      const beginRecord = Buffer.alloc(20);
+      beginRecord.writeUInt32LE(0, 0); // Begin
+      beginRecord.writeUInt32LE(0xdead, 4);
+      await handle.write(beginRecord, 0, beginRecord.length, stats.size);
+      const pageRecord = Buffer.alloc(20);
+      pageRecord.writeUInt32LE(1, 0); // Page
+      pageRecord.writeUInt32LE(0xdead, 4);
+      pageRecord.writeUInt32LE(99, 8);
+      pageRecord.writeUInt32LE(PAGE_SIZE_BYTES, 12);
+      pageRecord.writeUInt32LE(0, 16);
+      await handle.write(pageRecord, 0, pageRecord.length, stats.size + beginRecord.length);
+      // omit payload bytes to simulate torn frame
+    } finally {
+      await handle.close();
+    }
+
+    const recoveryWal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+    await recoveryWal.open();
+    await recoveryWal.replay(pageManager);
+
+    const page = await pageManager.readPage(11);
+    expect(page.equals(payload)).toBeTrue();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

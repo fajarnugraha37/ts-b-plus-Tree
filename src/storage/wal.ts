@@ -7,6 +7,7 @@ const HEADER_SIZE = 32;
 const RECORD_HEADER_SIZE = 20;
 
 enum RecordType {
+  Begin = 0,
   Page = 1,
   Commit = 2,
 }
@@ -52,6 +53,7 @@ export class WriteAheadLog {
     const txId = this.#nextTxId++;
     this.#pending.set(txId, []);
     this.#stats.pendingTransactions = this.#pending.size;
+    await this.#writeRecord(RecordType.Begin, txId, 0, Buffer.alloc(0));
     return txId;
   }
 
@@ -117,6 +119,13 @@ export class WriteAheadLog {
         const length = headerBuf.readUInt32LE(12);
         const checksum = headerBuf.readUInt32LE(16);
         offset += RECORD_HEADER_SIZE;
+
+        if (type === RecordType.Begin) {
+          if (!pending.has(txId)) {
+            pending.set(txId, []);
+          }
+          continue;
+        }
 
         if (type === RecordType.Page) {
           if (length !== this.pageSize || offset + length > stats.size) {

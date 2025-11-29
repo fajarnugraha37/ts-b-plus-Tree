@@ -3,14 +3,15 @@ import {
   MAX_INTERNAL_KEYS,
   MAX_LEAF_KEYS,
   PageType,
-  VALUE_SIZE_BYTES,
   PAGE_HEADER_SIZE,
 } from "../constants.ts";
 import { bufferToBigInt, bigintToBuffer } from "../utils/codec.ts";
 
 export interface LeafCell {
   key: bigint;
-  value: Buffer;
+  inlineValue: Buffer;
+  valueLength: number;
+  overflowPage: number;
 }
 
 export interface LeafPage {
@@ -39,11 +40,13 @@ function readHeader(buffer: Buffer): {
   type: PageType;
   keyCount: number;
   rightSibling: number;
+  payloadOffset: number;
 } {
   return {
     type: buffer.readUInt8(0),
     keyCount: buffer.readUInt16LE(2),
     rightSibling: buffer.readUInt32LE(4),
+    payloadOffset: buffer.readUInt16LE(8),
   };
 }
 
@@ -52,17 +55,35 @@ export function deserializeLeaf(buffer: Buffer): LeafPage {
   if (header.type !== PageType.Leaf) {
     throw new Error("Page is not a leaf");
   }
-
   const cells: LeafCell[] = [];
-  let offset = PAGE_HEADER_SIZE;
+  const pointerStart = PAGE_HEADER_SIZE;
+  const pointers =
+    header.keyCount <= 0
+      ? 0
+      : Math.min(header.keyCount, MAX_LEAF_KEYS) * 2;
   for (let i = 0; i < header.keyCount && i < MAX_LEAF_KEYS; i += 1) {
-    const keyBuffer = buffer.subarray(offset, offset + KEY_SIZE_BYTES);
-    offset += KEY_SIZE_BYTES;
-    const valueBuffer = buffer.subarray(offset, offset + VALUE_SIZE_BYTES);
-    offset += VALUE_SIZE_BYTES;
+    const pointerOffset = pointerStart + i * 2;
+    const cellOffset = buffer.readUInt16LE(pointerOffset);
+    if (cellOffset === 0) {
+      continue;
+    }
+    const keyLength = buffer.readUInt16LE(cellOffset);
+    const inlineLength = buffer.readUInt16LE(cellOffset + 2);
+    const totalValueLength = buffer.readUInt32LE(cellOffset + 4);
+    const overflowPage = buffer.readUInt32LE(cellOffset + 8);
+    const keyBuffer = buffer.subarray(
+      cellOffset + 12,
+      cellOffset + 12 + keyLength,
+    );
+    const valueBuffer = buffer.subarray(
+      cellOffset + 12 + keyLength,
+      cellOffset + 12 + keyLength + inlineLength,
+    );
     cells.push({
       key: bufferToBigInt(keyBuffer),
-      value: Buffer.from(valueBuffer),
+      inlineValue: Buffer.from(valueBuffer),
+      valueLength: totalValueLength,
+      overflowPage,
     });
   }
 
@@ -83,15 +104,26 @@ export function serializeLeaf(page: LeafPage, target: Buffer): void {
   target.writeUInt8(PageType.Leaf, 0);
   target.writeUInt16LE(page.cells.length, 2);
   target.writeUInt32LE(page.rightSibling, 4);
-
-  let offset = PAGE_HEADER_SIZE;
+  let pointerOffset = PAGE_HEADER_SIZE;
+  let payloadOffset = target.length;
   for (const cell of page.cells) {
     const keyBuffer = bigintToBuffer(cell.key);
-    keyBuffer.copy(target, offset);
-    offset += KEY_SIZE_BYTES;
-    cell.value.copy(target, offset);
-    offset += VALUE_SIZE_BYTES;
+    const inline = cell.inlineValue;
+    const recordSize = 12 + keyBuffer.length + inline.length;
+    payloadOffset -= recordSize;
+    if (payloadOffset <= pointerOffset) {
+      throw new Error("Leaf page overflow");
+    }
+    target.writeUInt16LE(keyBuffer.length, payloadOffset);
+    target.writeUInt16LE(inline.length, payloadOffset + 2);
+    target.writeUInt32LE(cell.valueLength, payloadOffset + 4);
+    target.writeUInt32LE(cell.overflowPage, payloadOffset + 8);
+    keyBuffer.copy(target, payloadOffset + 12);
+    inline.copy(target, payloadOffset + 12 + keyBuffer.length);
+    target.writeUInt16LE(payloadOffset, pointerOffset);
+    pointerOffset += 2;
   }
+  target.writeUInt16LE(payloadOffset, 8);
 }
 
 export function deserializeInternal(buffer: Buffer): InternalPage {
@@ -134,6 +166,7 @@ export function serializeInternal(page: InternalPage, target: Buffer): void {
   target.writeUInt8(PageType.Internal, 0);
   target.writeUInt16LE(page.cells.length, 2);
   target.writeUInt32LE(page.rightSibling, 4);
+  target.writeUInt16LE(0, 8);
 
   let offset = PAGE_HEADER_SIZE;
   target.writeUInt32LE(page.leftChild, offset);

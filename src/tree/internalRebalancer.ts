@@ -202,6 +202,7 @@ async function mergeWithLeft(
   entry.buffer = left.buffer;
   entry.page = left.page;
   entry.dirty = true;
+  entry.childIndex = slot - 1;
 }
 
 async function mergeWithRight(

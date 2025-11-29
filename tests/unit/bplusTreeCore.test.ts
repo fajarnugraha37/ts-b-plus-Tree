@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BPlusTree } from "../../index.ts";
-import { VALUE_SIZE_BYTES, PageType } from "../../src/constants.ts";
+import { PageType, MIN_INTERNAL_KEYS } from "../../src/constants.ts";
 import { deserializeInternal, deserializeLeaf } from "../../src/tree/pages.ts";
 import { utf8ValueSerializer, jsonValueSerializer } from "../../src/utils/codec.ts";
 import type { DiagnosticsSnapshot } from "../../src/diagnostics.ts";
@@ -30,10 +30,72 @@ async function withTreePath<T>(fn: (filePath: string) => Promise<T>): Promise<T>
   }
 }
 
+const DEFAULT_VALUE_BYTES = 128;
+const LARGE_VALUE_BYTES = 512;
+
 function bufferFromNumber(n: number): Buffer {
-  const buffer = Buffer.alloc(VALUE_SIZE_BYTES);
+  const buffer = Buffer.alloc(DEFAULT_VALUE_BYTES);
   buffer.writeUInt32LE(n, 0);
   return buffer;
+}
+
+function largeValueBuffer(n: number): Buffer {
+  const buffer = Buffer.alloc(LARGE_VALUE_BYTES);
+  buffer.writeUInt32LE(n, 0);
+  return buffer;
+}
+
+async function assertInternalOccupancy(tree: BPlusTree): Promise<void> {
+  const { rootPage, treeDepth } = tree.meta;
+  if (treeDepth <= 1) {
+    return;
+  }
+  const stack = [{ page: rootPage, depth: treeDepth }];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (current.depth === 1) {
+      continue;
+    }
+    const buffer = await tree.pageManager.readPage(current.page);
+    if (buffer.readUInt8(0) !== PageType.Internal) {
+      continue;
+    }
+    const node = deserializeInternal(buffer);
+    if (current.depth === treeDepth) {
+      expect(node.cells.length).toBeGreaterThanOrEqual(1);
+    } else {
+      expect(node.cells.length).toBeGreaterThanOrEqual(MIN_INTERNAL_KEYS);
+    }
+    const nextDepth = current.depth - 1;
+    stack.push({ page: node.leftChild, depth: nextDepth });
+    for (const cell of node.cells) {
+      stack.push({ page: cell.child, depth: nextDepth });
+    }
+  }
+}
+
+async function loadLeafForKey(tree: BPlusTree, key: number) {
+  let pageNumber = tree.meta.rootPage;
+  let depth = tree.meta.treeDepth;
+  const target = BigInt(key);
+  while (depth > 1) {
+    const buffer = await tree.bufferPool.getPage(pageNumber);
+    const node = deserializeInternal(buffer);
+    tree.bufferPool.unpin(pageNumber, false);
+    let child = node.leftChild;
+    for (const cell of node.cells) {
+      if (target < cell.key) {
+        break;
+      }
+      child = cell.child;
+    }
+    pageNumber = child;
+    depth -= 1;
+  }
+  const buffer = await tree.bufferPool.getPage(pageNumber);
+  const leaf = deserializeLeaf(buffer);
+  tree.bufferPool.unpin(pageNumber, false);
+  return leaf;
 }
 
 test("basic CRUD + range usage", async () => {
@@ -343,6 +405,66 @@ test("internal node redistribution keeps separators consistent", async () => {
   });
 });
 
+test(
+  "internal nodes collapse after cascading deletes",
+  async () => {
+  await withTreePath(async (filePath) => {
+    const tree = await BPlusTree.open({ filePath });
+    try {
+      const total = 4000;
+      for (let i = 0; i < total; i += 1) {
+        await tree.set(i, largeValueBuffer(i));
+      }
+      expect(tree.meta.treeDepth).toBeGreaterThanOrEqual(3);
+      for (let i = 0; i < 1500; i += 1) {
+        await tree.delete(i);
+      }
+      expect(tree.meta.treeDepth).toBeGreaterThanOrEqual(3);
+      await assertInternalOccupancy(tree);
+    } finally {
+      await tree.close();
+    }
+  });
+  },
+  { timeout: 120_000 },
+);
+
+test(
+  "internal occupancy persists across reopen after deletes",
+  async () => {
+  await withTreePath(async (filePath) => {
+    const total = 5000;
+    const tree = await BPlusTree.open({ filePath });
+    try {
+      for (let i = 0; i < total; i += 1) {
+        await tree.set(i, largeValueBuffer(i));
+      }
+      expect(tree.meta.treeDepth).toBeGreaterThanOrEqual(3);
+      for (let i = 0; i < 1500; i += 1) {
+        await tree.delete(i);
+      }
+      expect(tree.meta.treeDepth).toBeGreaterThanOrEqual(3);
+      await assertInternalOccupancy(tree);
+    } finally {
+      await tree.close();
+    }
+
+    const reopened = await BPlusTree.open({ filePath });
+    try {
+      await assertInternalOccupancy(reopened);
+      for (let i = total - 1; i >= total - 800; i -= 1) {
+        await reopened.delete(i);
+      }
+      expect(reopened.meta.treeDepth).toBeGreaterThanOrEqual(3);
+      await assertInternalOccupancy(reopened);
+    } finally {
+      await reopened.close();
+    }
+  });
+  },
+  { timeout: 120_000 },
+);
+
 test("diagnostics sink receives snapshots and alerts", async () => {
   await withTreePath(async (filePath) => {
     const snapshots: DiagnosticsSnapshot[] = [];
@@ -383,5 +505,24 @@ test("concurrent readers and writers", async () => {
       reader(),
     ]);
     expect(tree.meta.keyCount).toBeGreaterThan(0n);
+  });
+});
+
+test("overflow values spill to separate pages and are freed on delete", async () => {
+  await withTree(async (tree) => {
+    const bigValue = Buffer.alloc(tree.pageManager.pageSize * 3, 0xab);
+    await tree.set(999, bigValue);
+    const readBack = await tree.get(999);
+    expect(readBack?.equals(bigValue)).toBeTrue();
+
+    const leaf = await loadLeafForKey(tree, 999);
+    const cell = leaf.cells.find((c) => c.key === 999n);
+    expect(cell).toBeDefined();
+    expect(cell!.overflowPage).toBeGreaterThan(0);
+    expect(cell!.valueLength).toBe(bigValue.length);
+
+    await tree.delete(999);
+    const meta = await tree.pageManager.readMeta();
+    expect(meta.freePageHead).not.toBe(0);
   });
 });

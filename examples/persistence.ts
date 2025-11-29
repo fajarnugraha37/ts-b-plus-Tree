@@ -8,12 +8,12 @@ async function main() {
   const filePath = join(dir, "data.db");
 
   const first = await BPlusTree.open({ filePath });
-  await first.set(1, Buffer.from("first-run".padEnd(128, "\0")));
+  await first.set(1, Buffer.from("first-run"));
   await first.close();
 
   const reopened = await BPlusTree.open({ filePath });
   const value = await reopened.get(1);
-  console.log("value after reopen =", value?.toString("utf8").trim());
+  console.log("value after reopen =", value?.toString("utf8"));
   await reopened.close();
 
   await rm(dir, { recursive: true, force: true });

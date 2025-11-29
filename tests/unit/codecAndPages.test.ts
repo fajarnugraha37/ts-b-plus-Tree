@@ -11,7 +11,8 @@ import {
   serializeLeaf,
   serializeInternal,
 } from "../../src/tree/pages.ts";
-import { KEY_SIZE_BYTES, VALUE_SIZE_BYTES, PageType } from "../../src/constants.ts";
+import type { LeafPage } from "../../src/tree/pages.ts";
+import { KEY_SIZE_BYTES, PageType } from "../../src/constants.ts";
 
 test("codec converts between bigint and buffer", () => {
   const key = 0x1234_5678_9abcdn;
@@ -29,24 +30,31 @@ test("normalizeKeyInput accepts numbers, bigint, and buffers", () => {
   expect(bufferToBigInt(normalizeKeyInput(buf))).toBe(255n);
 });
 
-test("normalizeValueInput pads to VALUE_SIZE_BYTES", () => {
-  const small = Buffer.from("hello");
-  const normalized = normalizeValueInput(small);
-  expect(normalized.length).toBe(VALUE_SIZE_BYTES);
-  expect(normalized.subarray(0, small.length).toString()).toBe("hello");
-
-  const exact = Buffer.alloc(VALUE_SIZE_BYTES, 1);
-  expect(normalizeValueInput(exact)).not.toBe(exact); // copy
+test("normalizeValueInput returns a copied buffer", () => {
+  const original = Buffer.from("hello");
+  const normalized = normalizeValueInput(original);
+  expect(normalized.equals(original)).toBeTrue();
+  expect(normalized).not.toBe(original);
 });
 
 test("leaf page serialization round-trip", () => {
-  const leaf = {
+  const leaf: LeafPage = {
     type: PageType.Leaf as const,
     keyCount: 2,
     rightSibling: 99,
     cells: [
-      { key: 1n, value: normalizeValueInput(Buffer.from("a")) },
-      { key: 2n, value: normalizeValueInput(Buffer.from("b")) },
+      {
+        key: 1n,
+        inlineValue: Buffer.from("a"),
+        valueLength: 1,
+        overflowPage: 0,
+      },
+      {
+        key: 2n,
+        inlineValue: Buffer.from("b"),
+        valueLength: 1,
+        overflowPage: 0,
+      },
     ],
   };
   const buffer = Buffer.alloc(4096);
@@ -55,7 +63,9 @@ test("leaf page serialization round-trip", () => {
   expect(parsed.keyCount).toBe(2);
   expect(parsed.rightSibling).toBe(99);
   expect(parsed.cells.map((c) => c.key)).toEqual([1n, 2n]);
-  expect(parsed.cells[0]!.value.subarray(0, 1).toString()).toBe("a");
+  expect(parsed.cells[0]!.inlineValue.toString()).toBe("a");
+  expect(parsed.cells[0]!.valueLength).toBe(1);
+  expect(parsed.cells[0]!.overflowPage).toBe(0);
 });
 
 test("internal page serialization round-trip", () => {

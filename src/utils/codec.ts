@@ -1,4 +1,4 @@
-import { KEY_SIZE_BYTES, VALUE_SIZE_BYTES } from "../constants.ts";
+import { KEY_SIZE_BYTES } from "../constants.ts";
 
 export type KeyInput = Buffer | bigint | number;
 
@@ -56,19 +56,7 @@ export function normalizeKeyInput(input: KeyInput): Buffer {
 }
 
 export function normalizeValueInput(value: Buffer): Buffer {
-  if (value.length > VALUE_SIZE_BYTES) {
-    throw new Error(
-      `Values must be <= ${VALUE_SIZE_BYTES} bytes (received ${value.length})`,
-    );
-  }
-
-  if (value.length === VALUE_SIZE_BYTES) {
-    return Buffer.from(value);
-  }
-
-  const padded = Buffer.alloc(VALUE_SIZE_BYTES);
-  value.copy(padded);
-  return padded;
+  return Buffer.from(value);
 }
 
 export interface ValueSerializer<T> {
