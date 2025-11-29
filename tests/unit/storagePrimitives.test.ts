@@ -105,3 +105,27 @@ test("WriteAheadLog appends frames", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("PageManager vacuum reclaims trailing free pages", async () => {
+  const { dir, path } = await tempPath("vacuum.db");
+  try {
+    const pageManager = await PageManager.initialize(path);
+    const allocations: number[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      allocations.push(await pageManager.allocatePage());
+    }
+    const toFree = allocations.slice(-4);
+    for (const page of toFree) {
+      await pageManager.freePage(page);
+    }
+    const before = await pageManager.fragmentationStats();
+    expect(before.freePages).toBeGreaterThan(0);
+    const result = await pageManager.vacuumFreePages();
+    expect(result.reclaimed).toBe(toFree.length);
+    const after = await pageManager.fragmentationStats();
+    expect(after.totalPages).toBeLessThan(before.totalPages);
+    await pageManager.fileManager.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -205,7 +205,8 @@ export class BPlusTree {
   }
 
   async vacuum(): Promise<void> {
-    // TODO implement free list compaction
+    await this.bufferPool.flushAll();
+    await this.pageManager.vacuumFreePages();
   }
 
   async consistencyCheck(): Promise<boolean> {

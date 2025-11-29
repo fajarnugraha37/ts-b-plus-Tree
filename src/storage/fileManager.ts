@@ -58,6 +58,13 @@ export class FileManager {
     await this.#handle!.write(data, 0, data.length, this.#offset(pageNumber));
   }
 
+  async truncatePages(totalPages: number): Promise<void> {
+    if (!this.#handle) {
+      return;
+    }
+    await this.#handle.truncate(totalPages * this.pageSize);
+  }
+
   async pageCount(): Promise<number> {
     const stats = await this.#handle!.stat();
     return Math.ceil(stats.size / this.pageSize);

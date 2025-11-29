@@ -139,4 +139,97 @@ export class PageManager {
     buffer.writeUInt8(type, 0);
     await this.writePage(pageNumber, buffer);
   }
+
+  async fragmentationStats(): Promise<{
+    totalPages: number;
+    freePages: number;
+    fragmentation: number;
+  }> {
+    const meta = await this.readMeta();
+    const freePages = await this.#collectFreePages(meta);
+    const ratio = meta.totalPages === 0 ? 0 : freePages.length / meta.totalPages;
+    return {
+      totalPages: meta.totalPages,
+      freePages: freePages.length,
+      fragmentation: ratio,
+    };
+  }
+
+  async vacuumFreePages(): Promise<{
+    reclaimed: number;
+    totalPages: number;
+    freePages: number;
+    fragmentation: number;
+  }> {
+    const meta = await this.readMeta();
+    const freePages = await this.#collectFreePages(meta);
+    if (freePages.length === 0) {
+      return {
+        reclaimed: 0,
+        totalPages: meta.totalPages,
+        freePages: 0,
+        fragmentation: 0,
+      };
+    }
+    const freeSet = new Set(freePages);
+    let reclaimed = 0;
+    let newTotal = meta.totalPages;
+    while (newTotal - 1 >= 3) {
+      const candidate = newTotal - 1;
+      if (!freeSet.has(candidate)) {
+        break;
+      }
+      freeSet.delete(candidate);
+      reclaimed += 1;
+      newTotal -= 1;
+    }
+
+    if (reclaimed === 0) {
+      return {
+        reclaimed: 0,
+        totalPages: meta.totalPages,
+        freePages: freePages.length,
+        fragmentation: freePages.length / meta.totalPages,
+      };
+    }
+
+    const remainingFreePages = Array.from(freeSet).filter((page) => page >= 3);
+    remainingFreePages.sort((a, b) => a - b);
+    let head = 0;
+    for (const page of remainingFreePages) {
+      const buffer = Buffer.alloc(this.pageSize);
+      buffer.writeUInt32LE(head, 0);
+      await this.fileManager.writePage(page, buffer);
+      head = page;
+    }
+    meta.freePageHead = head;
+    meta.totalPages = newTotal;
+    await this.writeMeta(meta);
+    await this.fileManager.truncatePages(newTotal);
+
+    const fragmentation =
+      newTotal === 0 ? 0 : remainingFreePages.length / newTotal;
+    return {
+      reclaimed,
+      totalPages: newTotal,
+      freePages: remainingFreePages.length,
+      fragmentation,
+    };
+  }
+
+  async #collectFreePages(meta?: MetaPage): Promise<number[]> {
+    const targetMeta = meta ?? (await this.readMeta());
+    const freePages: number[] = [];
+    const seen = new Set<number>();
+    let cursor = targetMeta.freePageHead;
+    while (cursor !== 0 && !seen.has(cursor)) {
+      seen.add(cursor);
+      if (cursor >= 3) {
+        freePages.push(cursor);
+      }
+      const buffer = await this.fileManager.readPage(cursor);
+      cursor = buffer.readUInt32LE(0);
+    }
+    return freePages;
+  }
 }
