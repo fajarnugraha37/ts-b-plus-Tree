@@ -32,9 +32,9 @@ export class BufferPool {
   readonly wal?: WriteAheadLog;
   readonly groupCommit?: BufferPoolOptions["groupCommit"];
   readonly evictionPolicy: "LRU" | "clock";
+  readonly frames = new Map<number, BufferFrame>();
   #clockIndex = 0;
   #frameList: BufferFrame[] = [];
-  readonly frames = new Map<number, BufferFrame>();
   #stats: BufferPoolStats = {
     pageLoads: 0,
     pageFlushes: 0,
@@ -65,6 +65,9 @@ export class BufferPool {
       this.frames.set(pageNumber, frame);
       this.#stats.pageLoads += 1;
       this.#updateMaxResident();
+      if (this.evictionPolicy === "clock") {
+        this.#frameList = Array.from(this.frames.values());
+      }
     }
 
     frame.pinCount += 1;
@@ -110,6 +113,7 @@ export class BufferPool {
     if (this.evictionPolicy === "clock") {
       return this.#evictClock();
     }
+
     let candidate: BufferFrame | null = null;
     for (const frame of this.frames.values()) {
       if (frame.pinCount > 0) {
@@ -145,6 +149,29 @@ export class BufferPool {
     return { ...this.#stats };
   }
 
+  reset(): void {
+    this.frames.clear();
+    this.#frameList = [];
+    this.#clockIndex = 0;
+  }
+
+  async #ensureCapacity(): Promise<void> {
+    if (this.frames.size < this.capacity) {
+      return;
+    }
+
+    const evicted = await this.evictPage();
+    if (evicted === null) {
+      throw new Error("Buffer pool is full and all pages are pinned");
+    }
+  }
+
+  #updateMaxResident(): void {
+    if (this.frames.size > this.#stats.maxResidentPages) {
+      this.#stats.maxResidentPages = this.frames.size;
+    }
+  }
+
   async #evictClock(): Promise<number | null> {
     if (this.#frameList.length === 0) {
       this.#frameList = Array.from(this.frames.values());
@@ -165,22 +192,5 @@ export class BufferPool {
       return frame.pageNumber;
     }
     return null;
-  }
-
-  async #ensureCapacity(): Promise<void> {
-    if (this.frames.size < this.capacity) {
-      return;
-    }
-
-    const evicted = await this.evictPage();
-    if (evicted === null) {
-      throw new Error("Buffer pool is full and all pages are pinned");
-    }
-  }
-
-  #updateMaxResident(): void {
-    if (this.frames.size > this.#stats.maxResidentPages) {
-      this.#stats.maxResidentPages = this.frames.size;
-    }
   }
 }

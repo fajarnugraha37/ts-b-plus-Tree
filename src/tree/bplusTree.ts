@@ -4,6 +4,7 @@ import {
   MAX_LEAF_KEYS,
   MIN_LEAF_KEYS,
   PageType,
+  MAGIC,
 } from "../constants.ts";
 import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
@@ -146,40 +147,9 @@ export class BPlusTree {
       const key = bufferToBigInt(keyBuffer);
       const normalizedValue = normalizeValueInput(value);
 
-      const { path, leaf } = await this.#traverseToLeaf(key, true);
-
-      try {
-        const existingIndex = leaf.page.cells.findIndex((cell) => cell.key === key);
-        if (existingIndex >= 0) {
-          leaf.page.cells[existingIndex] = { key, value: normalizedValue };
-          this.#releaseLeaf(leaf, true);
-          return;
-        }
-
-        const insertIndex = this.#insertIntoLeaf(leaf.page, key, normalizedValue);
-        if (insertIndex === 0) {
-          const parent = path[path.length - 1];
-          if (parent) {
-            this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
-          }
-        }
-
-        while (leaf.page.cells.length > MAX_LEAF_KEYS) {
-          const split = await this.#splitLeaf(leaf);
-          await this.#propagateSplit(path, split.key, split.pageNumber);
-        }
-
-        this.#releaseLeaf(leaf, true);
-        await this.#mutateMeta((meta) => {
-          meta.keyCount += 1n;
-        });
-        await this.#maybeCheckpoint();
-        await this.#emitDiagnostics("set");
-      } finally {
-        for (const entry of path) {
-          this.#releaseInternal(entry, entry.dirty);
-        }
-      }
+      await this.#insertKeyValue(key, normalizedValue);
+      await this.#maybeCheckpoint();
+      await this.#emitDiagnostics("set");
     } finally {
       release();
     }
@@ -294,6 +264,29 @@ export class BPlusTree {
     const release = await this.#rwLock.acquireWrite();
     try {
       await this.bufferPool.flushAll();
+      await this.wal.checkpoint(this.pageManager);
+      const entries = await this.#collectAllEntries();
+      this.bufferPool.reset();
+      await this.wal.reset();
+      const freshMeta: MetaPage = {
+        magic: MAGIC,
+        pageSize: this.pageManager.pageSize,
+        rootPage: 2,
+        treeDepth: 1,
+        totalPages: 3,
+        keyCount: 0n,
+        freePageHead: 0,
+      };
+      await this.pageManager.writeMeta(freshMeta);
+      await this.pageManager.resetPage(2, PageType.Leaf);
+      this.meta = freshMeta;
+      for (const entry of entries) {
+        await this.#insertKeyValue(
+          bufferToBigInt(entry.key),
+          normalizeValueInput(entry.value),
+        );
+      }
+      await this.#emitDiagnostics("defragment");
     } finally {
       release();
     }
@@ -539,6 +532,40 @@ export class BPlusTree {
     page.cells.splice(idx, 0, { key, child });
   }
 
+  async #insertKeyValue(key: bigint, normalizedValue: Buffer): Promise<void> {
+    const { path, leaf } = await this.#traverseToLeaf(key, true);
+    try {
+      const existingIndex = leaf.page.cells.findIndex((cell) => cell.key === key);
+      if (existingIndex >= 0) {
+        leaf.page.cells[existingIndex] = { key, value: normalizedValue };
+        this.#releaseLeaf(leaf, true);
+        return;
+      }
+
+      const insertIndex = this.#insertIntoLeaf(leaf.page, key, normalizedValue);
+      if (insertIndex === 0) {
+        const parent = path[path.length - 1];
+        if (parent) {
+          this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
+        }
+      }
+
+      while (leaf.page.cells.length > MAX_LEAF_KEYS) {
+        const split = await this.#splitLeaf(leaf);
+        await this.#propagateSplit(path, split.key, split.pageNumber);
+      }
+
+      this.#releaseLeaf(leaf, true);
+      await this.#mutateMeta((meta) => {
+        meta.keyCount += 1n;
+      });
+    } finally {
+      for (const entry of path) {
+        this.#releaseInternal(entry, entry.dirty);
+      }
+    }
+  }
+
   #childPageNumber(page: InternalPage, slot: number): number | null {
     if (slot < -1 || slot > page.cells.length - 1) {
       return null;
@@ -650,6 +677,36 @@ export class BPlusTree {
     const buffer = await this.bufferPool.getPage(pageNumber);
     const page = deserializeInternal(buffer);
     return { pageNumber, buffer, page };
+  }
+
+  async #collectAllEntries(): Promise<Array<{ key: Buffer; value: Buffer }>> {
+    const entries: Array<{ key: Buffer; value: Buffer }> = [];
+    let pageNumber = this.meta.rootPage;
+    for (let depth = this.meta.treeDepth; depth > 1; depth -= 1) {
+      const internal = await this.#loadInternal(pageNumber);
+      pageNumber = internal.page.leftChild;
+      this.#releaseInternal(internal, false);
+    }
+    let leaf = await this.#loadLeaf(pageNumber);
+    try {
+      while (true) {
+        for (const cell of leaf.page.cells) {
+          entries.push({
+            key: Buffer.from(normalizeKeyInput(cell.key)),
+            value: Buffer.from(cell.value),
+          });
+        }
+        if (!leaf.page.rightSibling) {
+          break;
+        }
+        const nextLeaf = await this.#loadLeaf(leaf.page.rightSibling);
+        this.#releaseLeaf(leaf, false);
+        leaf = nextLeaf;
+      }
+    } finally {
+      this.#releaseLeaf(leaf, false);
+    }
+    return entries;
   }
 
   #releaseLeaf(page: LoadedPage<LeafPage>, dirty: boolean): void {

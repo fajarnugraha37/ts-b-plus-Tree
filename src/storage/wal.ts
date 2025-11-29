@@ -160,9 +160,10 @@ export class WriteAheadLog {
   }
 
   async reset(): Promise<void> {
-    await this.open();
-    await this.#handle!.truncate(HEADER_SIZE);
-    await this.#handle!.sync();
+    await this.#handle?.close();
+    this.#handle = await open(this.walPath, "w+");
+    this.#stats = { framesWritten: 0, commits: 0, pendingTransactions: 0 };
+    await this.#ensureHeader();
   }
 
   getStats(): WalStats {
