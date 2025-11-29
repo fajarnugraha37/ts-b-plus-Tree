@@ -261,3 +261,61 @@ test("multi-level structure survives reopen with sorted separators", async () =>
     await reopened.close();
   });
 });
+
+test("internal node redistribution keeps separators consistent", async () => {
+  await withTree(async (tree) => {
+    const total = 900;
+    for (let i = 0; i < total; i += 1) {
+      await tree.set(i, bufferFromNumber(i));
+    }
+    if (tree.meta.treeDepth < 2) {
+      throw new Error("expected multi-level tree for redistribution test");
+    }
+
+    const scanInternalNodes = async () => {
+      await tree.bufferPool.flushAll();
+      const result: Array<{ page: number; keys: number[] }> = [];
+      const stack: Array<{ page: number; depth: number }> = [
+        { page: tree.meta.rootPage, depth: tree.meta.treeDepth },
+      ];
+      while (stack.length) {
+        const current = stack.pop()!;
+        if (current.depth === 1) {
+          continue;
+        }
+        const buffer = await tree.pageManager.readPage(current.page);
+        if (buffer.readUInt8(0) !== PageType.Internal) {
+          continue;
+        }
+        const node = deserializeInternal(buffer);
+        expect(node.cells.length).toBeGreaterThanOrEqual(1);
+        for (let i = 1; i < node.cells.length; i += 1) {
+          expect(node.cells[i]!.key).toBeGreaterThan(node.cells[i - 1]!.key);
+        }
+        result.push({
+          page: current.page,
+          keys: node.cells.map((c) => Number(c!.key)),
+        });
+        stack.push({ page: node.leftChild, depth: current.depth - 1 });
+        for (const cell of node.cells) {
+          stack.push({ page: cell.child, depth: current.depth - 1 });
+        }
+      }
+      return result;
+    };
+
+    const before = await scanInternalNodes();
+    expect(before.length).toBeGreaterThan(0);
+
+    for (let i = 0; i < total; i += 2) {
+      await tree.delete(i);
+    }
+
+    const after = await scanInternalNodes();
+    expect(after.length).toBeGreaterThan(0);
+    for (const node of after) {
+      expect(node.keys.length).toBeGreaterThan(0);
+    }
+    expect(await tree.consistencyCheck()).toBeTrue();
+  });
+});
