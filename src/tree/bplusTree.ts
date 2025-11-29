@@ -52,8 +52,12 @@ export class BPlusTree {
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
     const pageManager = await PageManager.initialize(options.filePath);
-    const wal = new WriteAheadLog(options.walPath ?? `${options.filePath}.wal`);
+    const wal = new WriteAheadLog(
+      options.walPath ?? `${options.filePath}.wal`,
+      pageManager.pageSize,
+    );
     await wal.open();
+    await wal.replay(pageManager);
     const bufferPool = new BufferPool(pageManager, {
       capacity: options.bufferPages ?? BUFFER_POOL_PAGES,
       wal,
@@ -64,6 +68,7 @@ export class BPlusTree {
 
   async close(): Promise<void> {
     await this.bufferPool.flushAll();
+    await this.wal.checkpoint(this.pageManager);
     await this.wal.close();
     await this.pageManager.fileManager.sync();
     await this.pageManager.fileManager.close();

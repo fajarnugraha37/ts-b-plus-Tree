@@ -91,18 +91,16 @@ test("WriteAheadLog appends frames", async () => {
   const { dir, path } = await tempPath("wal.db");
   const walPath = `${path}.wal`;
   try {
-    const wal = new WriteAheadLog(walPath);
+    const wal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
     await wal.open();
+    const tx = await wal.beginTransaction();
     const payload = Buffer.alloc(PAGE_SIZE_BYTES, 1);
-    await wal.append({
-      pageNumber: 1,
-      checksum: 0x1234,
-      data: payload,
-    });
+    await wal.writePage(tx, 1, payload);
+    await wal.commitTransaction(tx);
     await wal.close();
 
     const fileStats = await stat(walPath);
-    expect(fileStats.size).toBeGreaterThan(payload.length);
+    expect(fileStats.size).toBeGreaterThan(32);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

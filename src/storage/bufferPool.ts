@@ -78,12 +78,11 @@ export class BufferPool {
     if (!frame || !frame.dirty) {
       return;
     }
+    const walData = Buffer.from(frame.buffer);
     if (this.wal) {
-      await this.wal.append({
-        pageNumber,
-        checksum: checksum(frame.buffer),
-        data: Buffer.from(frame.buffer),
-      });
+      const txId = await this.wal.beginTransaction();
+      await this.wal.writePage(txId, pageNumber, walData);
+      await this.wal.commitTransaction(txId);
     }
     await this.pageManager.writePage(pageNumber, frame.buffer);
     frame.dirty = false;
@@ -148,12 +147,4 @@ export class BufferPool {
       this.#stats.maxResidentPages = this.frames.size;
     }
   }
-}
-
-function checksum(buffer: Buffer): number {
-  let sum = 0;
-  for (const byte of buffer.values()) {
-    sum = (sum + byte) & 0xffffffff;
-  }
-  return sum >>> 0;
 }
