@@ -18,6 +18,7 @@ export interface MetaPage {
 
 export interface PageManagerOptions {
   pageSize?: number;
+  readAheadPages?: number;
 }
 
 export class PageManager {

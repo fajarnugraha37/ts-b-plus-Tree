@@ -4,20 +4,23 @@ import { PAGE_SIZE_BYTES } from "../constants.ts";
 
 export interface FileManagerOptions {
   pageSize?: number;
+  readAheadPages?: number;
 }
 
 export class FileManager {
   #handle: FileHandle | null = null;
   readonly pageSize: number;
+  readonly readAheadPages: number;
 
-  private constructor(handle: FileHandle, pageSize: number) {
+  private constructor(handle: FileHandle, pageSize: number, readAheadPages = 0) {
     this.#handle = handle;
     this.pageSize = pageSize;
+    this.readAheadPages = readAheadPages;
   }
 
   static async openOrCreate(
     filePath: string,
-    { pageSize = PAGE_SIZE_BYTES }: FileManagerOptions = {},
+    { pageSize = PAGE_SIZE_BYTES, readAheadPages = 0 }: FileManagerOptions = {},
   ): Promise<FileManager> {
     let handle: FileHandle;
     try {
@@ -28,7 +31,7 @@ export class FileManager {
       }
       handle = await open(filePath, "w+");
     }
-    const manager = new FileManager(handle, pageSize);
+    const manager = new FileManager(handle, pageSize, readAheadPages);
     await manager.#ensureMinimumPages(3);
     return manager;
   }
@@ -46,6 +49,12 @@ export class FileManager {
     const buffer = Buffer.alloc(this.pageSize);
     await this.#ensureMinimumPages(pageNumber + 1);
     await this.#handle!.read(buffer, 0, this.pageSize, this.#offset(pageNumber));
+    if (this.readAheadPages > 0) {
+      for (let i = 1; i <= this.readAheadPages; i += 1) {
+        const nextOffset = this.#offset(pageNumber + i);
+        await this.#handle!.read(Buffer.alloc(0), 0, 0, nextOffset);
+      }
+    }
     return buffer;
   }
 

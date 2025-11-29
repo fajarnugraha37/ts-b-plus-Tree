@@ -42,6 +42,10 @@ interface BPlusTreeOptions {
     rssBytes?: number;
     bufferPages?: number;
   };
+  fileOptions?: {
+    pageSize?: number;
+    readAheadPages?: number;
+  };
 }
 
 export class BPlusTree {
@@ -76,7 +80,7 @@ export class BPlusTree {
   }
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
-    const pageManager = await PageManager.initialize(options.filePath);
+    const pageManager = await PageManager.initialize(options.filePath, options.fileOptions);
     const wal = new WriteAheadLog(
       options.walPath ?? `${options.filePath}.wal`,
       pageManager.pageSize,
