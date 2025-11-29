@@ -2,7 +2,6 @@ import {
   BUFFER_POOL_PAGES,
   MAX_INTERNAL_KEYS,
   MAX_LEAF_KEYS,
-  MIN_INTERNAL_KEYS,
   MIN_LEAF_KEYS,
   PageType,
 } from "../constants.ts";
@@ -23,22 +22,14 @@ import {
 import type { MetaPage } from "../storage/pageManager.ts";
 import type { InternalPage, LeafPage } from "./pages.ts";
 import type { KeyInput } from "../utils/codec.ts";
-
-interface LoadedPage<T> {
-  pageNumber: number;
-  buffer: Buffer;
-  page: T;
-}
+import type { InternalPathEntry, LoadedPage } from "./types.ts";
+import type { InternalRebalanceContext } from "./internalRebalancer.ts";
+import { rebalanceInternalPath } from "./internalRebalancer.ts";
 
 interface BPlusTreeOptions {
   filePath: string;
   walPath?: string;
   bufferPages?: number;
-}
-
-interface InternalPathEntry extends LoadedPage<InternalPage> {
-  dirty: boolean;
-  childIndex: number;
 }
 
 export class BPlusTree {
@@ -86,8 +77,7 @@ export class BPlusTree {
       if (index < 0) {
         return null;
       }
-      const cell = leaf.page.cells[index];
-      return cell ? Buffer.from(cell.value) : null;
+      return Buffer.from(leaf.page.cells[index]!.value);
     } finally {
       this.#releaseLeaf(leaf, false);
     }
@@ -115,10 +105,12 @@ export class BPlusTree {
           this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
         }
       }
+
       while (leaf.page.cells.length > MAX_LEAF_KEYS) {
         const split = await this.#splitLeaf(leaf);
         await this.#propagateSplit(path, split.key, split.pageNumber);
       }
+
       this.#releaseLeaf(leaf, true);
       await this.#mutateMeta((meta) => {
         meta.keyCount += 1n;
@@ -136,6 +128,7 @@ export class BPlusTree {
     let deleted = false;
     let leafDirty = false;
     let currentLeaf: LoadedPage<LeafPage> | null = leaf;
+
     try {
       const idx = leaf.page.cells.findIndex((cell) => cell.key === key);
       if (idx >= 0) {
@@ -152,7 +145,7 @@ export class BPlusTree {
         const rebalanced = await this.#rebalanceLeafAfterDelete(leaf, path, leafDirty);
         currentLeaf = rebalanced.leaf;
         leafDirty = rebalanced.dirty;
-        await this.#rebalanceInternalPath(path);
+        await rebalanceInternalPath(this.#internalContext(), path);
       }
       if (currentLeaf) {
         this.#releaseLeaf(currentLeaf, leafDirty);
@@ -207,7 +200,7 @@ export class BPlusTree {
   }
 
   async vacuum(): Promise<void> {
-    // Placeholder for page compaction strategy
+    // TODO implement free list compaction
   }
 
   async consistencyCheck(): Promise<boolean> {
@@ -250,14 +243,13 @@ export class BPlusTree {
     if (!parent) {
       return { leaf, dirty };
     }
-    const slot = parent.childIndex;
     const minKeys = Math.max(1, MIN_LEAF_KEYS);
     if (leaf.page.cells.length >= minKeys) {
-      this.#updateParentKeyForLeaf(parent, slot, leaf.page);
+      this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
       return { leaf, dirty };
     }
 
-    const leftSlot = slot - 1;
+    const leftSlot = parent.childIndex - 1;
     const leftPageNumber = this.#childPageNumber(parent.page, leftSlot);
     if (leftPageNumber !== null) {
       const leftLeaf = await this.#loadLeaf(leftPageNumber);
@@ -265,7 +257,7 @@ export class BPlusTree {
         const borrowed = leftLeaf.page.cells.pop();
         if (borrowed) {
           leaf.page.cells.unshift(borrowed);
-          this.#updateParentKeyForLeaf(parent, slot, leaf.page);
+          this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
           this.#releaseLeaf(leftLeaf, true);
           return { leaf, dirty: true };
         }
@@ -273,7 +265,7 @@ export class BPlusTree {
       this.#releaseLeaf(leftLeaf, false);
     }
 
-    const rightSlot = slot + 1;
+    const rightSlot = parent.childIndex + 1;
     const rightPageNumber = this.#childPageNumber(parent.page, rightSlot);
     if (rightPageNumber !== null) {
       const rightLeaf = await this.#loadLeaf(rightPageNumber);
@@ -282,7 +274,7 @@ export class BPlusTree {
         if (borrowed) {
           leaf.page.cells.push(borrowed);
           this.#updateParentKeyForLeaf(parent, rightSlot, rightLeaf.page);
-          this.#updateParentKeyForLeaf(parent, slot, leaf.page);
+          this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
           this.#releaseLeaf(rightLeaf, true);
           return { leaf, dirty: true };
         }
@@ -297,7 +289,7 @@ export class BPlusTree {
       this.bufferPool.unpin(leaf.pageNumber, false);
       this.bufferPool.dropPage(leaf.pageNumber);
       await this.pageManager.freePage(leaf.pageNumber);
-      this.#removeParentCell(parent, slot);
+      this.#removeParentCell(parent, parent.childIndex);
       parent.childIndex = leftSlot;
       this.#updateParentKeyForLeaf(parent, leftSlot, leftLeaf.page);
       return { leaf: leftLeaf, dirty: true };
@@ -311,266 +303,13 @@ export class BPlusTree {
       this.bufferPool.dropPage(rightLeaf.pageNumber);
       await this.pageManager.freePage(rightLeaf.pageNumber);
       this.#removeParentCell(parent, rightSlot);
-      this.#updateParentKeyForLeaf(parent, slot, leaf.page);
+      this.#updateParentKeyForLeaf(parent, parent.childIndex, leaf.page);
       return { leaf, dirty: true };
     }
 
     return { leaf, dirty };
   }
 
-  async #rebalanceInternalPath(path: InternalPathEntry[]): Promise<void> {
-    for (let i = path.length - 1; i >= 0; i -= 1) {
-      const entry = path[i];
-      if (!entry) {
-        continue;
-      }
-      const isRoot = i === 0;
-      const minKeys = isRoot ? 1 : MIN_INTERNAL_KEYS;
-      if (entry.page.cells.length >= minKeys) {
-        continue;
-      }
-      if (isRoot) {
-        const shrunk = await this.#shrinkRootIfNeeded(path, entry);
-        if (shrunk) {
-          return;
-        }
-        continue;
-      }
-      await this.#rebalanceInternalEntry(path, i);
-    }
-  }
-
-  async #rebalanceInternalEntry(
-    path: InternalPathEntry[],
-    index: number,
-  ): Promise<void> {
-    if (index === 0) {
-      return;
-    }
-    const entry = path[index];
-    const parent = path[index - 1];
-    if (!entry || !parent) {
-      return;
-    }
-    const slot = parent.childIndex;
-    if (await this.#borrowFromLeftInternal(entry, parent, slot)) {
-      return;
-    }
-    if (await this.#borrowFromRightInternal(entry, parent, slot)) {
-      return;
-    }
-    await this.#mergeInternal(path, index, parent, slot);
-  }
-
-  async #borrowFromLeftInternal(
-    entry: InternalPathEntry,
-    parent: InternalPathEntry,
-    slot: number,
-  ): Promise<boolean> {
-    if (slot < 0) {
-      return false;
-    }
-    const leftSlot = slot - 1;
-    const leftPageNumber = this.#childPageNumber(parent.page, leftSlot);
-    if (leftPageNumber === null) {
-      return false;
-    }
-    const left = await this.#loadInternal(leftPageNumber);
-    if (left.page.cells.length <= MIN_INTERNAL_KEYS) {
-      this.#releaseInternal(left, false);
-      return false;
-    }
-    const separator = parent.page.cells[slot];
-    if (!separator) {
-      this.#releaseInternal(left, false);
-      return false;
-    }
-    const borrowed = left.page.cells.pop();
-    if (!borrowed) {
-      this.#releaseInternal(left, false);
-      return false;
-    }
-    entry.page.cells.unshift({
-      key: separator.key,
-      child: entry.page.leftChild,
-    });
-    entry.page.leftChild = borrowed.child;
-    separator.key = borrowed.key;
-    entry.dirty = true;
-    parent.dirty = true;
-    this.#releaseInternal(left, true);
-    return true;
-  }
-
-  async #borrowFromRightInternal(
-    entry: InternalPathEntry,
-    parent: InternalPathEntry,
-    slot: number,
-  ): Promise<boolean> {
-    const rightSlot = slot + 1;
-    if (rightSlot > parent.page.cells.length - 1) {
-      return false;
-    }
-    const rightPageNumber = this.#childPageNumber(parent.page, rightSlot);
-    if (rightPageNumber === null) {
-      return false;
-    }
-    const right = await this.#loadInternal(rightPageNumber);
-    if (right.page.cells.length <= MIN_INTERNAL_KEYS) {
-      this.#releaseInternal(right, false);
-      return false;
-    }
-    const separatorIndex = slot + 1;
-    const separator = parent.page.cells[separatorIndex];
-    if (!separator) {
-      this.#releaseInternal(right, false);
-      return false;
-    }
-    const shifted = right.page.cells.shift();
-    if (!shifted) {
-      this.#releaseInternal(right, false);
-      return false;
-    }
-    const movedChild = right.page.leftChild;
-    entry.page.cells.push({
-      key: separator.key,
-      child: movedChild,
-    });
-    separator.key = shifted.key;
-    right.page.leftChild = shifted.child;
-    entry.dirty = true;
-    parent.dirty = true;
-    this.#releaseInternal(right, true);
-    return true;
-  }
-
-  async #mergeInternal(
-    path: InternalPathEntry[],
-    index: number,
-    parent: InternalPathEntry,
-    slot: number,
-  ): Promise<void> {
-    const entry = path[index];
-    const parentEntry = parent;
-    if (!entry) {
-      return;
-    }
-    if (slot >= 0) {
-      const leftPageNumber = this.#childPageNumber(parent.page, slot - 1);
-      if (leftPageNumber !== null) {
-        await this.#mergeWithLeftInternal(path, index, parent, slot, leftPageNumber);
-        return;
-      }
-    }
-    const rightPageNumber = this.#childPageNumber(parent.page, slot + 1);
-    if (rightPageNumber === null) {
-      throw new Error("Internal node merge failed: no siblings available");
-    }
-    await this.#mergeWithRightInternal(path, index, parent, slot, rightPageNumber);
-  }
-
-  async #mergeWithLeftInternal(
-    path: InternalPathEntry[],
-    index: number,
-    parent: InternalPathEntry,
-    slot: number,
-    leftPageNumber: number,
-  ): Promise<void> {
-    const entry = path[index];
-    if (!entry) {
-      return;
-    }
-    const left = await this.#loadInternal(leftPageNumber);
-    const parentKeyIndex = slot;
-    const parentKey = parent.page.cells[parentKeyIndex];
-    if (!parentKey) {
-      this.#releaseInternal(left, false);
-      return;
-    }
-    left.page.cells.push({
-      key: parentKey.key,
-      child: entry.page.leftChild,
-    });
-    for (const cell of entry.page.cells) {
-      left.page.cells.push(cell);
-    }
-    left.page.rightSibling = entry.page.rightSibling;
-    this.#removeParentCell(parent, parentKeyIndex);
-    parent.childIndex = slot - 1;
-    this.bufferPool.unpin(entry.pageNumber, false);
-    this.bufferPool.dropPage(entry.pageNumber);
-    await this.pageManager.freePage(entry.pageNumber);
-    entry.pageNumber = left.pageNumber;
-    entry.buffer = left.buffer;
-    entry.page = left.page;
-    entry.dirty = true;
-  }
-
-  async #mergeWithRightInternal(
-    path: InternalPathEntry[],
-    index: number,
-    parent: InternalPathEntry,
-    slot: number,
-    rightPageNumber: number,
-  ): Promise<void> {
-    const entry = path[index];
-    if (!entry) {
-      return;
-    }
-    const right = await this.#loadInternal(rightPageNumber);
-    const parentKeyIndex = slot + 1;
-    const parentKey = parent.page.cells[parentKeyIndex];
-    if (!parentKey) {
-      this.#releaseInternal(right, false);
-      return;
-    }
-    entry.page.cells.push({
-      key: parentKey.key,
-      child: right.page.leftChild,
-    });
-    for (const cell of right.page.cells) {
-      entry.page.cells.push(cell);
-    }
-    entry.page.rightSibling = right.page.rightSibling;
-    entry.dirty = true;
-    this.#removeParentCell(parent, parentKeyIndex);
-    this.bufferPool.unpin(right.pageNumber, false);
-    this.bufferPool.dropPage(right.pageNumber);
-    await this.pageManager.freePage(right.pageNumber);
-  }
-
-  async #shrinkRootIfNeeded(
-    path: InternalPathEntry[],
-    rootEntry: InternalPathEntry,
-  ): Promise<boolean> {
-    if (this.meta.treeDepth <= 1) {
-      return false;
-    }
-    if (rootEntry.page.cells.length > 0) {
-      return false;
-    }
-    const newRootPageNumber = rootEntry.page.leftChild;
-    if (!newRootPageNumber) {
-      return false;
-    }
-    await this.#mutateMeta((meta) => {
-      meta.rootPage = newRootPageNumber;
-      meta.treeDepth -= 1;
-    });
-    this.bufferPool.unpin(rootEntry.pageNumber, false);
-    this.bufferPool.dropPage(rootEntry.pageNumber);
-    await this.pageManager.freePage(rootEntry.pageNumber);
-    if (this.meta.treeDepth === 1) {
-      path.length = 0;
-      return true;
-    }
-    const newRoot = await this.#loadInternal(newRootPageNumber);
-    rootEntry.pageNumber = newRoot.pageNumber;
-    rootEntry.buffer = newRoot.buffer;
-    rootEntry.page = newRoot.page;
-    rootEntry.dirty = false;
-    return false;
-  }
   async #splitLeaf(
     leaf: LoadedPage<LeafPage>,
   ): Promise<{ key: bigint; pageNumber: number }> {
@@ -587,11 +326,11 @@ export class BPlusTree {
     leaf.page.rightSibling = siblingPageNumber;
     serializeLeaf(siblingPage, siblingBuffer);
     this.bufferPool.unpin(siblingPageNumber, true);
-    const firstSiblingCell = siblingPage.cells[0];
-    if (!firstSiblingCell) {
+    const first = siblingPage.cells[0];
+    if (!first) {
       throw new Error("Leaf split produced empty sibling");
     }
-    return { key: firstSiblingCell.key, pageNumber: siblingPageNumber };
+    return { key: first.key, pageNumber: siblingPageNumber };
   }
 
   async #propagateSplit(
@@ -612,7 +351,6 @@ export class BPlusTree {
       if (entry.page.cells.length <= MAX_INTERNAL_KEYS) {
         return;
       }
-
       const sibling = await this.#splitInternal(entry);
       promoteKey = sibling.key;
       promoteChild = sibling.pageNumber;
@@ -645,7 +383,7 @@ export class BPlusTree {
     const midpoint = Math.ceil(entry.page.cells.length / 2) - 1;
     const promote = entry.page.cells[midpoint];
     if (!promote) {
-      throw new Error("Internal page split failed: no promote key");
+      throw new Error("Internal page split failed");
     }
     const rightCells = entry.page.cells.splice(midpoint + 1);
     const rightPageNumber = await this.pageManager.allocatePage();
@@ -755,7 +493,7 @@ export class BPlusTree {
     if (page.cells.length === 0) {
       return { child, slot: -1 };
     }
-    for (let i = 0; i < page.cells.length; i++) {
+    for (let i = 0; i < page.cells.length; i += 1) {
       const cell = page.cells[i];
       if (!cell) {
         continue;
@@ -799,5 +537,19 @@ export class BPlusTree {
       serializeInternal(page.page, page.buffer);
     }
     this.bufferPool.unpin(page.pageNumber, dirty);
+  }
+
+  #internalContext(): InternalRebalanceContext {
+    return {
+      bufferPool: this.bufferPool,
+      pageManager: this.pageManager,
+      getMeta: () => this.meta,
+      mutateMeta: (mutator) => this.#mutateMeta(mutator),
+      childPageNumber: (page, slot) => this.#childPageNumber(page, slot),
+      removeParentCell: (parent, index) => this.#removeParentCell(parent, index),
+      loadInternal: (pageNumber) => this.#loadInternal(pageNumber),
+      releaseInternal: (page, dirty) => this.#releaseInternal(page, dirty),
+      dropPage: (pageNumber) => this.bufferPool.dropPage(pageNumber),
+    };
   }
 }
