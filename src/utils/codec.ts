@@ -71,10 +71,10 @@ export function normalizeValueInput(value: Buffer): Buffer {
   return padded;
 }
 
-export type ValueSerializer<T> = {
+export interface ValueSerializer<T> {
   serialize(input: T): Buffer;
   deserialize(buffer: Buffer): T;
-};
+}
 
 export const utf8ValueSerializer: ValueSerializer<string> = {
   serialize(input: string): Buffer {
