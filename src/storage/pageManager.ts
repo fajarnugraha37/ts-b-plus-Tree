@@ -172,6 +172,7 @@ export class PageManager {
       };
     }
     const freeSet = new Set(freePages);
+
     let reclaimed = 0;
     let newTotal = meta.totalPages;
     while (newTotal - 1 >= 3) {
@@ -185,6 +186,7 @@ export class PageManager {
     }
 
     if (reclaimed === 0) {
+      await this.#rewriteFreeList(meta, freePages);
       return {
         reclaimed: 0,
         totalPages: meta.totalPages,
@@ -195,14 +197,7 @@ export class PageManager {
 
     const remainingFreePages = Array.from(freeSet).filter((page) => page >= 3);
     remainingFreePages.sort((a, b) => a - b);
-    let head = 0;
-    for (const page of remainingFreePages) {
-      const buffer = Buffer.alloc(this.pageSize);
-      buffer.writeUInt32LE(head, 0);
-      await this.fileManager.writePage(page, buffer);
-      head = page;
-    }
-    meta.freePageHead = head;
+    await this.#rewriteFreeList(meta, remainingFreePages);
     meta.totalPages = newTotal;
     await this.writeMeta(meta);
     await this.fileManager.truncatePages(newTotal);
@@ -231,5 +226,17 @@ export class PageManager {
       cursor = buffer.readUInt32LE(0);
     }
     return freePages;
+  }
+
+  async #rewriteFreeList(meta: MetaPage, pages: number[]): Promise<void> {
+    let head = 0;
+    for (const page of pages) {
+      const buffer = Buffer.alloc(this.pageSize);
+      buffer.writeUInt32LE(head, 0);
+      await this.fileManager.writePage(page, buffer);
+      head = page;
+    }
+    meta.freePageHead = head;
+    await this.writeMeta(meta);
   }
 }
