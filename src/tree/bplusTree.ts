@@ -290,6 +290,7 @@ export class BPlusTree {
       };
       await this.pageManager.writeMeta(freshMeta);
       await this.pageManager.resetPage(2, PageType.Leaf);
+      await this.pageManager.fileManager.truncatePages(3);
       this.meta = freshMeta;
       for (const entry of entries) {
         await this.#insertKeyValue(

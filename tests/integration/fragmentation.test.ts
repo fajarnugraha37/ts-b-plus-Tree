@@ -39,3 +39,38 @@ test(
   },
   { timeout: 120_000 },
 );
+
+test(
+  "defragment rebuilds overflow chains correctly",
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ts-btree-frag-overflow-"));
+    const filePath = join(dir, "frag-overflow.db");
+    const tree = await BPlusTree.open({ filePath });
+    try {
+      const total = 200;
+      const values = new Map<number, Buffer>();
+      for (let i = 0; i < total; i += 1) {
+        const value = Buffer.alloc(tree.pageManager.pageSize * 2, i & 0xff);
+        value.writeUInt32LE(i, 0);
+        values.set(i, value);
+        await tree.set(i, value);
+      }
+      for (let i = 0; i < total; i += 4) {
+        await tree.delete(i);
+        values.delete(i);
+      }
+      const before = await tree.pageManager.fragmentationStats();
+      await tree.defragment();
+      const after = await tree.pageManager.fragmentationStats();
+      expect(after.fragmentation).toBeLessThanOrEqual(before.fragmentation);
+      for (const [key, buffer] of values.entries()) {
+        const value = await tree.get(key);
+        expect(value?.equals(buffer)).toBeTrue();
+      }
+    } finally {
+      await tree.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  { timeout: 120_000 },
+);
