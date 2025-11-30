@@ -11,6 +11,8 @@
     "example:crud": "bun run examples/basicCrud.ts",
     "example:persistence": "bun run examples/persistence.ts",
     "example:scan": "bun run examples/rangeScan.ts",
+    "example:restore": "bun run examples/restorePoint.ts",
+    "example:advanced": "bun run examples/advancedOps.ts",
     "bench": "bun test benchmarks",
     "cli": "bun run tools/cli.ts"
   },
