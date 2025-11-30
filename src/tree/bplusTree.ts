@@ -8,9 +8,11 @@ import {
   KEY_SIZE_BYTES,
   PAGE_HEADER_SIZE,
 } from "../constants.ts";
+import { join, basename } from "path";
 import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
 import { OverflowManager } from "../storage/overflowManager.ts";
+import { PageLatchManager } from "../storage/latchManager.ts";
 import { WriteAheadLog } from "../storage/wal.ts";
 import {
   deserializeInternal,
@@ -51,6 +53,11 @@ interface BPlusTreeOptions {
     pageSize?: number;
     readAheadPages?: number;
   };
+  io?: {
+    pageSize?: number;
+    readAheadPages?: number;
+    walDirectory?: string;
+  };
 }
 
 export class BPlusTree {
@@ -58,6 +65,7 @@ export class BPlusTree {
   readonly bufferPool: BufferPool;
   readonly wal: WriteAheadLog;
   readonly overflowManager: OverflowManager;
+  readonly latchManager = new PageLatchManager();
   meta: MetaPage;
   #checkpointIntervalOps: number;
   #opsSinceCheckpoint = 0;
@@ -87,9 +95,25 @@ export class BPlusTree {
   }
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
-    const pageManager = await PageManager.initialize(options.filePath, options.fileOptions);
+    const ioOptions = options.io ?? {};
+    const requestedPageSize = ioOptions.pageSize ?? options.fileOptions?.pageSize;
+    if (requestedPageSize !== undefined) {
+      if (!Number.isInteger(requestedPageSize) || requestedPageSize < 512 || requestedPageSize % 512 !== 0) {
+        throw new Error("pageSize must be a multiple of 512 bytes");
+      }
+    }
+    const readAheadPages = ioOptions.readAheadPages ?? options.fileOptions?.readAheadPages;
+    const pageManager = await PageManager.initialize(options.filePath, {
+      pageSize: requestedPageSize,
+      readAheadPages,
+    });
+    const derivedWalPath =
+      options.walPath ??
+      (ioOptions.walDirectory
+        ? join(ioOptions.walDirectory, `${basename(options.filePath)}.wal`)
+        : undefined);
     const wal = new WriteAheadLog(
-      options.walPath ?? `${options.filePath}.wal`,
+      derivedWalPath ?? `${options.filePath}.wal`,
       pageManager.pageSize,
       { compressFrames: options.walOptions?.compressFrames },
     );
@@ -122,6 +146,7 @@ export class BPlusTree {
       await this.wal.close();
       await this.pageManager.fileManager.sync();
       await this.pageManager.fileManager.close();
+      this.latchManager.reset();
       await this.#emitDiagnostics("close");
     } finally {
       release();
@@ -129,20 +154,16 @@ export class BPlusTree {
   }
 
   async get(keyInput: KeyInput): Promise<Buffer | null> {
-    const release = await this.#rwLock.acquireRead();
+    const key = bufferToBigInt(normalizeKeyInput(keyInput));
+    const { leaf, release } = await this.#findLeafForKey(key);
     try {
-      const key = bufferToBigInt(normalizeKeyInput(keyInput));
-      const { leaf } = await this.#traverseToLeaf(key);
-      try {
-        const index = leaf.page.cells.findIndex((cell) => cell.key === key);
-        if (index < 0) {
-          return null;
-        }
-        return await this.#materializeCellValue(leaf.page.cells[index]!);
-      } finally {
-        this.#releaseLeaf(leaf, false);
+      const index = leaf.page.cells.findIndex((cell) => cell.key === key);
+      if (index < 0) {
+        return null;
       }
+      return await this.#materializeCellValue(leaf.page.cells[index]!);
     } finally {
+      this.#releaseLeaf(leaf, false);
       release();
     }
   }
@@ -212,41 +233,41 @@ export class BPlusTree {
     key: Buffer;
     value: Buffer;
   }> {
-    const release = await this.#rwLock.acquireRead();
-    try {
-      const startKey = bufferToBigInt(normalizeKeyInput(startInput));
-      const endKey = bufferToBigInt(normalizeKeyInput(endInput));
-      if (endKey < startKey) {
-        return;
-      }
+    const startKey = bufferToBigInt(normalizeKeyInput(startInput));
+    const endKey = bufferToBigInt(normalizeKeyInput(endInput));
+    if (endKey < startKey) {
+      return;
+    }
 
-      let { leaf } = await this.#traverseToLeaf(startKey);
-      try {
-        while (true) {
-          for (const cell of leaf.page.cells) {
-            if (cell.key < startKey) {
-              continue;
-            }
-            if (cell.key > endKey) {
-              return;
-            }
-            const value = await this.#materializeCellValue(cell);
-            yield {
-              key: Buffer.from(normalizeKeyInput(cell.key)),
-              value,
-            };
+    let { leaf, release } = await this.#findLeafForKey(startKey);
+    try {
+      while (true) {
+        for (const cell of leaf.page.cells) {
+          if (cell.key < startKey) {
+            continue;
           }
-          if (!leaf.page.rightSibling) {
+          if (cell.key > endKey) {
             return;
           }
-          const nextLeaf = await this.#loadLeaf(leaf.page.rightSibling);
-          this.#releaseLeaf(leaf, false);
-          leaf = nextLeaf;
+          const value = await this.#materializeCellValue(cell);
+          yield {
+            key: Buffer.from(normalizeKeyInput(cell.key)),
+            value,
+          };
         }
-      } finally {
+        if (!leaf.page.rightSibling) {
+          return;
+        }
+        const nextPage = leaf.page.rightSibling;
+        const nextRelease = await this.latchManager.acquireShared(nextPage);
+        const nextLeaf = await this.#loadLeaf(nextPage);
         this.#releaseLeaf(leaf, false);
+        release();
+        leaf = nextLeaf;
+        release = nextRelease;
       }
     } finally {
+      this.#releaseLeaf(leaf, false);
       release();
     }
   }
@@ -278,6 +299,7 @@ export class BPlusTree {
       await this.wal.checkpoint(this.pageManager);
       const entries = await this.#collectAllEntries();
       this.bufferPool.reset();
+      this.latchManager.reset();
       await this.wal.reset();
       const freshMeta: MetaPage = {
         magic: MAGIC,
@@ -693,6 +715,33 @@ export class BPlusTree {
     return { leaf, path };
   }
 
+  async #findLeafForKey(
+    key: bigint,
+  ): Promise<{ leaf: LoadedPage<LeafPage>; release: () => void }> {
+    const snapshot = { rootPage: this.meta.rootPage, depth: this.meta.treeDepth };
+    let pageNumber = snapshot.rootPage;
+    let depth = snapshot.depth;
+    let release = await this.latchManager.acquireShared(pageNumber);
+
+    if (depth === 1) {
+      const leaf = await this.#loadLeaf(pageNumber);
+      return this.#maybeMoveRightForSearch(leaf, release, key);
+    }
+
+    for (; depth > 1; depth -= 1) {
+      const internal = await this.#loadInternal(pageNumber);
+      const { child } = this.#pickChildSlot(internal.page, key);
+      this.#releaseInternal(internal, false);
+      const nextRelease = await this.latchManager.acquireShared(child);
+      release();
+      pageNumber = child;
+      release = nextRelease;
+    }
+
+    const leaf = await this.#loadLeaf(pageNumber);
+    return this.#maybeMoveRightForSearch(leaf, release, key);
+  }
+
   #pickChildSlot(
     page: InternalPage,
     key: bigint,
@@ -853,6 +902,36 @@ export class BPlusTree {
   #maxInlineValueBytes(): number {
     const overhead = PAGE_HEADER_SIZE + 2 + KEY_SIZE_BYTES + 12;
     return Math.max(0, this.pageManager.pageSize - overhead);
+  }
+
+  #leafHighKey(page: LeafPage): bigint | null {
+    if (page.cells.length === 0) {
+      return null;
+    }
+    return page.cells[page.cells.length - 1]!.key;
+  }
+
+  async #maybeMoveRightForSearch(
+    leaf: LoadedPage<LeafPage>,
+    release: () => void,
+    key: bigint,
+  ): Promise<{ leaf: LoadedPage<LeafPage>; release: () => void }> {
+    let currentLeaf = leaf;
+    let currentRelease = release;
+    while (currentLeaf.page.rightSibling) {
+      const highKey = this.#leafHighKey(currentLeaf.page);
+      if (highKey === null || key <= highKey) {
+        break;
+      }
+      const siblingPage = currentLeaf.page.rightSibling;
+      const siblingRelease = await this.latchManager.acquireShared(siblingPage);
+      const siblingLeaf = await this.#loadLeaf(siblingPage);
+      this.#releaseLeaf(currentLeaf, false);
+      currentRelease();
+      currentLeaf = siblingLeaf;
+      currentRelease = siblingRelease;
+    }
+    return { leaf: currentLeaf, release: currentRelease };
   }
 
   async #emitDiagnostics(reason: string): Promise<void> {
