@@ -26,10 +26,13 @@ test(
       for (let i = 0; i < total; i += 2) {
         await tree.delete(i);
       }
+      for (let i = total - 1; i >= total - 200; i -= 1) {
+        await tree.delete(i);
+      }
       const before = await tree.pageManager.fragmentationStats();
       await delay(500);
       const after = await tree.pageManager.fragmentationStats();
-      expect(after.freePages).toBeLessThanOrEqual(before.freePages);
+      expect(after.totalPages).toBeLessThanOrEqual(before.totalPages);
     } finally {
       await tree.close();
       await rm(dir, { recursive: true, force: true });

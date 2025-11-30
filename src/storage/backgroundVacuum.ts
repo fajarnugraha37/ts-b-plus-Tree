@@ -56,27 +56,14 @@ export class BackgroundVacuum {
   }
 
   async #runBatch(): Promise<void> {
-    const meta = await this.#pageManager.readMeta();
-    const freePages = await this.#pageManager.collectFreePages(meta);
-    if (freePages.length === 0) {
+    const result = await this.#pageManager.vacuumFreePages();
+    if (result.reclaimed === 0) {
       this.#idleBatches += 1;
       if (this.#idleBatches >= this.#options.maxIdleBatches) {
         this.#stopRequested = true;
       }
-      return;
-    }
-    this.#idleBatches = 0;
-
-    const remaining = freePages
-      .filter((page) => page >= 3)
-      .sort((a, b) => a - b);
-    const candidates = remaining.splice(0, this.#options.batchSize);
-    if (candidates.length === 0) {
-      return;
-    }
-    await this.#pageManager.rewriteFreeList(meta, remaining);
-    for (const page of candidates) {
-      await this.#pageManager.freePage(page);
+    } else {
+      this.#idleBatches = 0;
     }
   }
 }
