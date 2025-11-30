@@ -149,6 +149,17 @@ export class PageManager {
     await this.writePage(pageNumber, buffer);
   }
 
+  async sync(): Promise<void> {
+    await this.fileManager.sync?.();
+  }
+
+  async getFilePaths(): Promise<string[]> {
+    if (typeof (this.fileManager as any).getFilePaths === "function") {
+      return await (this.fileManager as any).getFilePaths();
+    }
+    return [];
+  }
+
   async fragmentationStats(): Promise<{
     totalPages: number;
     freePages: number;

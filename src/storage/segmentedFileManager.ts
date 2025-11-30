@@ -1,4 +1,5 @@
-import { stat } from "fs/promises";
+import { readdir, stat } from "fs/promises";
+import { basename, dirname, join } from "path";
 import { FileManager, type FileManagerOptions } from "./fileManager.ts";
 import { PageType } from "../constants.ts";
 
@@ -109,6 +110,23 @@ export class SegmentedFileManager {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async getFilePaths(): Promise<string[]> {
+    const dir = dirname(this.basePath);
+    const base = basename(this.basePath);
+    try {
+      const entries = await readdir(dir);
+      const matches = entries
+        .filter((name) => name === base || name.startsWith(`${base}.seg`))
+        .map((name) => join(dir, name));
+      if (!matches.includes(this.basePath)) {
+        matches.unshift(this.basePath);
+      }
+      return matches;
+    } catch {
+      return [this.basePath];
     }
   }
 

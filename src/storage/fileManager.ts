@@ -11,11 +11,18 @@ export class FileManager {
   #handle: FileHandle | null = null;
   readonly pageSize: number;
   readonly readAheadPages: number;
+  readonly filePath: string;
 
-  private constructor(handle: FileHandle, pageSize: number, readAheadPages = 0) {
+  private constructor(
+    filePath: string,
+    handle: FileHandle,
+    pageSize: number,
+    readAheadPages = 0,
+  ) {
     this.#handle = handle;
     this.pageSize = pageSize;
     this.readAheadPages = readAheadPages;
+    this.filePath = filePath;
   }
 
   static async openOrCreate(
@@ -31,7 +38,7 @@ export class FileManager {
       }
       handle = await open(filePath, "w+");
     }
-    const manager = new FileManager(handle, pageSize, readAheadPages);
+    const manager = new FileManager(filePath, handle, pageSize, readAheadPages);
     await manager.#ensureMinimumPages(3);
     return manager;
   }
@@ -77,6 +84,10 @@ export class FileManager {
   async pageCount(): Promise<number> {
     const stats = await this.#handle!.stat();
     return Math.ceil(stats.size / this.pageSize);
+  }
+
+  async getFilePaths(): Promise<string[]> {
+    return [this.filePath];
   }
 
   #offset(pageNumber: number): number {
