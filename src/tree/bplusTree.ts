@@ -13,6 +13,7 @@ import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
 import { OverflowManager } from "../storage/overflowManager.ts";
 import { PageLatchManager } from "../storage/latchManager.ts";
+import { SegmentedFileManager } from "../storage/segmentedFileManager.ts";
 import { BackgroundVacuum, type VacuumOptions } from "../storage/backgroundVacuum.ts";
 import { WriteAheadLog } from "../storage/wal.ts";
 import {
@@ -59,6 +60,7 @@ interface BPlusTreeOptions {
     pageSize?: number;
     readAheadPages?: number;
     walDirectory?: string;
+    segmentPages?: number;
   };
   maintenance?: {
     backgroundVacuum?: boolean;
@@ -120,9 +122,18 @@ export class BPlusTree {
       }
     }
     const readAheadPages = ioOptions.readAheadPages ?? options.fileOptions?.readAheadPages;
+    const segmentPages = ioOptions.segmentPages;
     const pageManager = await PageManager.initialize(options.filePath, {
       pageSize: requestedPageSize,
       readAheadPages,
+      fileManagerFactory: segmentPages
+        ? () =>
+            SegmentedFileManager.openOrCreate(options.filePath, {
+              pageSize: requestedPageSize,
+              readAheadPages,
+              segmentPages,
+            })
+        : undefined,
     });
     const derivedWalPath =
       options.walPath ??

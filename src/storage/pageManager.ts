@@ -19,6 +19,7 @@ export interface MetaPage {
 export interface PageManagerOptions {
   pageSize?: number;
   readAheadPages?: number;
+  fileManagerFactory?: () => Promise<any>;
 }
 
 export class PageManager {
@@ -34,7 +35,14 @@ export class PageManager {
     filePath: string,
     options: PageManagerOptions = {},
   ): Promise<PageManager> {
-    const fileManager = await FileManager.openOrCreate(filePath, options);
+    const {
+      pageSize,
+      readAheadPages,
+      fileManagerFactory,
+    } = options;
+    const fileManager = fileManagerFactory
+      ? await fileManagerFactory()
+      : await FileManager.openOrCreate(filePath, { pageSize, readAheadPages });
     const manager = new PageManager(fileManager, fileManager.pageSize);
     const meta = await manager.readMeta();
     if (meta.magic !== MAGIC) {
