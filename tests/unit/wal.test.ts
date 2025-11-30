@@ -6,12 +6,18 @@ import { PageManager } from "../../src/storage/pageManager.ts";
 import { WriteAheadLog } from "../../src/storage/wal.ts";
 import { PAGE_SIZE_BYTES } from "../../src/constants.ts";
 
-async function setupEnv() {
+interface EnvOptions {
+  compress?: boolean;
+}
+
+async function setupEnv(options: EnvOptions = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ts-btree-wal-"));
   const filePath = join(dir, "data.db");
   const pageManager = await PageManager.initialize(filePath);
   const walPath = `${filePath}.wal`;
-  const wal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES);
+  const wal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES, {
+    compressFrames: options.compress ?? false,
+  });
   await wal.open();
   return { dir, filePath, pageManager, wal, walPath };
 }
@@ -103,6 +109,31 @@ test("WAL recovers after simulated crash mid-commit", async () => {
 
     const finalPage = await pageManager.readPage(4);
     expect(finalPage.equals(payload)).toBeTrue();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("compressed WAL frames replay correctly", async () => {
+  const { dir, pageManager, walPath } = await setupEnv({ compress: true });
+  try {
+    const wal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES, {
+      compressFrames: true,
+    });
+    await wal.open();
+    const tx = await wal.beginTransaction();
+    const payload = Buffer.alloc(PAGE_SIZE_BYTES, 0xaa);
+    await wal.writePage(tx, 12, payload);
+    await wal.commitTransaction(tx);
+    await wal.close();
+
+    const replayWal = new WriteAheadLog(walPath, PAGE_SIZE_BYTES, {
+      compressFrames: true,
+    });
+    await replayWal.open();
+    await replayWal.replay(pageManager);
+    const page = await pageManager.readPage(12);
+    expect(page.equals(payload)).toBeTrue();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

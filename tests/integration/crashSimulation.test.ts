@@ -132,3 +132,31 @@ test(
   },
   { timeout: 120_000 },
 );
+
+test(
+  "compressed WAL survives crash and replays large values",
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ts-btree-crash-compress-"));
+    const filePath = join(dir, "compress.db");
+    const tree = await BPlusTree.open({
+      filePath,
+      walOptions: { compressFrames: true },
+    });
+    const bigValue = Buffer.alloc(tree.pageManager.pageSize * 2, 0xee);
+    await tree.set(42, bigValue);
+    await crashTree(tree);
+
+    const reopened = await BPlusTree.open({
+      filePath,
+      walOptions: { compressFrames: true },
+    });
+    try {
+      const value = await reopened.get(42);
+      expect(value?.equals(bigValue)).toBeTrue();
+    } finally {
+      await reopened.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  { timeout: 120_000 },
+);

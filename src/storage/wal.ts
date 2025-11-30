@@ -1,10 +1,12 @@
 import { open, stat } from "fs/promises";
+import { brotliCompressSync, brotliDecompressSync } from "zlib";
 import type { FileHandle } from "fs/promises";
 import type { PageManager } from "./pageManager.ts";
 
 const WAL_MAGIC = "TSWALV1";
 const HEADER_SIZE = 32;
 const RECORD_HEADER_SIZE = 20;
+const COMPRESSED_FLAG = 0x80000000;
 
 enum RecordType {
   Begin = 0,
@@ -30,10 +32,12 @@ export class WriteAheadLog {
   #nextTxId = 1;
   #pending = new Map<number, PendingFrame[]>();
   #stats: WalStats = { framesWritten: 0, commits: 0, pendingTransactions: 0 };
+  #compressFrames: boolean;
 
-  constructor(walPath: string, pageSize: number) {
+  constructor(walPath: string, pageSize: number, options?: { compressFrames?: boolean }) {
     this.walPath = walPath;
     this.pageSize = pageSize;
+    this.#compressFrames = options?.compressFrames ?? false;
   }
 
   async open(): Promise<void> {
@@ -78,7 +82,16 @@ export class WriteAheadLog {
     }
     await this.#ensureHeader();
     for (const frame of frames) {
-      await this.#writeRecord(RecordType.Page, txId, frame.pageNumber, frame.data);
+      let payload = Buffer.from(frame.data);
+      let lengthFlags = 0;
+      if (this.#compressFrames) {
+        const compressed = brotliCompressSync(payload);
+        if (compressed.length + RECORD_HEADER_SIZE < payload.length) {
+          payload = compressed;
+          lengthFlags = COMPRESSED_FLAG;
+        }
+      }
+      await this.#writeRecord(RecordType.Page, txId, frame.pageNumber, payload, lengthFlags);
       this.#stats.framesWritten += 1;
     }
     await this.#writeRecord(RecordType.Commit, txId, 0, Buffer.alloc(0));
@@ -116,7 +129,9 @@ export class WriteAheadLog {
         const type = headerBuf.readUInt32LE(0);
         const txId = headerBuf.readUInt32LE(4);
         const pageNumber = headerBuf.readUInt32LE(8);
-        const length = headerBuf.readUInt32LE(12);
+        const rawLength = headerBuf.readUInt32LE(12);
+        const isCompressed = (rawLength & COMPRESSED_FLAG) !== 0;
+        const length = rawLength & ~COMPRESSED_FLAG;
         const checksum = headerBuf.readUInt32LE(16);
         offset += RECORD_HEADER_SIZE;
 
@@ -128,7 +143,7 @@ export class WriteAheadLog {
         }
 
         if (type === RecordType.Page) {
-          if (length !== this.pageSize || offset + length > stats.size) {
+          if (length <= 0 || offset + length > stats.size) {
             break;
           }
           const data = Buffer.alloc(length);
@@ -137,8 +152,19 @@ export class WriteAheadLog {
           if (checksum !== checksumBuffer(data)) {
             continue;
           }
+          let frameData = data;
+          if (isCompressed) {
+            try {
+              frameData = brotliDecompressSync(data);
+            } catch {
+              continue;
+            }
+          }
+          if (frameData.length !== this.pageSize) {
+            continue;
+          }
           const frames = pending.get(txId) ?? [];
-          frames.push({ pageNumber, data });
+          frames.push({ pageNumber, data: frameData });
           pending.set(txId, frames);
         } else if (type === RecordType.Commit) {
           const frames = pending.get(txId);
@@ -184,12 +210,14 @@ export class WriteAheadLog {
     txId: number,
     pageNumber: number,
     data: Buffer,
+    lengthFlags = 0,
   ): Promise<void> {
     const header = Buffer.alloc(RECORD_HEADER_SIZE);
     header.writeUInt32LE(type, 0);
     header.writeUInt32LE(txId, 4);
     header.writeUInt32LE(pageNumber, 8);
-    header.writeUInt32LE(data.length, 12);
+    const lengthField = (((data.length & 0x7fffffff) | lengthFlags) >>> 0);
+    header.writeUInt32LE(lengthField, 12);
     header.writeUInt32LE(checksumBuffer(data), 16);
     await this.#handle!.write(header);
     if (data.length > 0) {

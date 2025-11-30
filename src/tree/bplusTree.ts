@@ -40,6 +40,7 @@ interface BPlusTreeOptions {
   walOptions?: {
     groupCommit?: boolean;
     checkpointIntervalOps?: number;
+    compressFrames?: boolean;
   };
   diagnostics?: DiagnosticsSink;
   limits?: {
@@ -90,6 +91,7 @@ export class BPlusTree {
     const wal = new WriteAheadLog(
       options.walPath ?? `${options.filePath}.wal`,
       pageManager.pageSize,
+      { compressFrames: options.walOptions?.compressFrames },
     );
     await wal.open();
     await wal.replay(pageManager);
