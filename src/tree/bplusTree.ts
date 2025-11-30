@@ -13,6 +13,7 @@ import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
 import { OverflowManager } from "../storage/overflowManager.ts";
 import { PageLatchManager } from "../storage/latchManager.ts";
+import { BackgroundVacuum, type VacuumOptions } from "../storage/backgroundVacuum.ts";
 import { WriteAheadLog } from "../storage/wal.ts";
 import {
   deserializeInternal,
@@ -58,6 +59,10 @@ interface BPlusTreeOptions {
     readAheadPages?: number;
     walDirectory?: string;
   };
+  maintenance?: {
+    backgroundVacuum?: boolean;
+    vacuumOptions?: VacuumOptions;
+  };
 }
 
 export class BPlusTree {
@@ -66,6 +71,9 @@ export class BPlusTree {
   readonly wal: WriteAheadLog;
   readonly overflowManager: OverflowManager;
   readonly latchManager = new PageLatchManager();
+  #backgroundVacuum?: BackgroundVacuum;
+  #vacuumOptions?: VacuumOptions;
+  #vacuumEnabled = false;
   meta: MetaPage;
   #checkpointIntervalOps: number;
   #opsSinceCheckpoint = 0;
@@ -82,6 +90,7 @@ export class BPlusTree {
     walOptions?: BPlusTreeOptions["walOptions"],
     diagnostics?: DiagnosticsSink,
     limits?: BPlusTreeOptions["limits"],
+    maintenance?: BPlusTreeOptions["maintenance"],
   ) {
     this.pageManager = pageManager;
     this.bufferPool = bufferPool;
@@ -92,6 +101,10 @@ export class BPlusTree {
     this.#diagnostics = diagnostics;
     this.#rssLimit = limits?.rssBytes ?? 100 * 1024 * 1024;
     this.#bufferPageLimit = limits?.bufferPages;
+    this.#vacuumOptions = maintenance?.vacuumOptions ?? {};
+    if (maintenance?.backgroundVacuum) {
+      this.#vacuumEnabled = true;
+    }
   }
 
   static async open(options: BPlusTreeOptions): Promise<BPlusTree> {
@@ -127,7 +140,7 @@ export class BPlusTree {
         : undefined,
     });
     const meta = await pageManager.readMeta();
-    return new BPlusTree(
+    const tree = new BPlusTree(
       pageManager,
       bufferPool,
       wal,
@@ -135,12 +148,18 @@ export class BPlusTree {
       options.walOptions,
       options.diagnostics,
       options.limits,
+      options.maintenance,
     );
+    if (tree.#vacuumEnabled) {
+      tree.#startBackgroundVacuum();
+    }
+    return tree;
   }
 
   async close(): Promise<void> {
     const release = await this.#rwLock.acquireWrite();
     try {
+      await this.#stopBackgroundVacuum();
       await this.bufferPool.flushAll();
       await this.wal.checkpoint(this.pageManager);
       await this.wal.close();
@@ -295,6 +314,8 @@ export class BPlusTree {
   async defragment(): Promise<void> {
     const release = await this.#rwLock.acquireWrite();
     try {
+      const restartVacuum = this.#vacuumEnabled;
+      await this.#stopBackgroundVacuum();
       await this.bufferPool.flushAll();
       await this.wal.checkpoint(this.pageManager);
       const entries = await this.#collectAllEntries();
@@ -321,6 +342,9 @@ export class BPlusTree {
         );
       }
       await this.#emitDiagnostics("defragment");
+      if (restartVacuum) {
+        this.#startBackgroundVacuum();
+      }
     } finally {
       release();
     }
@@ -331,6 +355,9 @@ export class BPlusTree {
     try {
       await this.bufferPool.flushAll();
       await this.pageManager.vacuumFreePages();
+      if (!this.#vacuumEnabled) {
+        await this.#getVacuumManager().runOnce();
+      }
     } finally {
       release();
     }
@@ -964,5 +991,25 @@ export class BPlusTree {
         snapshot,
       );
     }
+  }
+
+  #startBackgroundVacuum(): void {
+    this.#getVacuumManager().start();
+  }
+
+  async #stopBackgroundVacuum(): Promise<void> {
+    if (this.#backgroundVacuum) {
+      await this.#backgroundVacuum.stop();
+    }
+  }
+
+  #getVacuumManager(): BackgroundVacuum {
+    if (!this.#backgroundVacuum) {
+      this.#backgroundVacuum = new BackgroundVacuum(
+        this.pageManager,
+        this.#vacuumOptions ?? {},
+      );
+    }
+    return this.#backgroundVacuum;
   }
 }

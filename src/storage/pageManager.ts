@@ -147,7 +147,7 @@ export class PageManager {
     fragmentation: number;
   }> {
     const meta = await this.readMeta();
-    const freePages = await this.#collectFreePages(meta);
+    const freePages = await this.collectFreePages(meta);
     const ratio = meta.totalPages === 0 ? 0 : freePages.length / meta.totalPages;
     return {
       totalPages: meta.totalPages,
@@ -163,7 +163,7 @@ export class PageManager {
     fragmentation: number;
   }> {
     const meta = await this.readMeta();
-    const freePages = await this.#collectFreePages(meta);
+    const freePages = await this.collectFreePages(meta);
     if (freePages.length === 0) {
       return {
         reclaimed: 0,
@@ -187,7 +187,7 @@ export class PageManager {
     }
 
     if (reclaimed === 0) {
-      await this.#rewriteFreeList(meta, freePages);
+      await this.rewriteFreeList(meta, freePages);
       return {
         reclaimed: 0,
         totalPages: meta.totalPages,
@@ -198,7 +198,7 @@ export class PageManager {
 
     const remainingFreePages = Array.from(freeSet).filter((page) => page >= 3);
     remainingFreePages.sort((a, b) => a - b);
-    await this.#rewriteFreeList(meta, remainingFreePages);
+    await this.rewriteFreeList(meta, remainingFreePages);
     meta.totalPages = newTotal;
     await this.writeMeta(meta);
     await this.fileManager.truncatePages(newTotal);
@@ -213,7 +213,7 @@ export class PageManager {
     };
   }
 
-  async #collectFreePages(meta?: MetaPage): Promise<number[]> {
+  async collectFreePages(meta?: MetaPage): Promise<number[]> {
     const targetMeta = meta ?? (await this.readMeta());
     const freePages: number[] = [];
     const seen = new Set<number>();
@@ -229,7 +229,7 @@ export class PageManager {
     return freePages;
   }
 
-  async #rewriteFreeList(meta: MetaPage, pages: number[]): Promise<void> {
+  async rewriteFreeList(meta: MetaPage, pages: number[]): Promise<void> {
     let head = 0;
     for (const page of pages) {
       const buffer = Buffer.alloc(this.pageSize);
