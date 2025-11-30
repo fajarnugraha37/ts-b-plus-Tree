@@ -160,3 +160,43 @@ test(
   },
   { timeout: 120_000 },
 );
+
+test(
+  "group-commit flushes recover after crash",
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ts-btree-groupcommit-"));
+    const filePath = join(dir, "groupcommit.db");
+    const tree = await BPlusTree.open({
+      filePath,
+      walOptions: {
+        groupCommit: true,
+        checkpointIntervalOps: 0,
+      },
+    });
+    const total = 300;
+    for (let i = 0; i < total; i += 1) {
+      await tree.set(i, valueFor(i));
+    }
+    await tree.bufferPool.flushAll();
+    await crashTree(tree);
+
+    const reopened = await BPlusTree.open({
+      filePath,
+      walOptions: {
+        groupCommit: true,
+        checkpointIntervalOps: 0,
+      },
+    });
+    try {
+      for (let i = 0; i < total; i += 30) {
+        const value = await reopened.get(i);
+        expect(value?.equals(valueFor(i))).toBeTrue();
+      }
+      expect(await reopened.consistencyCheck()).toBeTrue();
+    } finally {
+      await reopened.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  { timeout: 120_000 },
+);

@@ -44,6 +44,7 @@ interface BPlusTreeOptions {
     groupCommit?: boolean;
     checkpointIntervalOps?: number;
     compressFrames?: boolean;
+    checkpointIntervalMs?: number;
   };
   diagnostics?: DiagnosticsSink;
   limits?: {
@@ -77,6 +78,8 @@ export class BPlusTree {
   meta: MetaPage;
   #checkpointIntervalOps: number;
   #opsSinceCheckpoint = 0;
+  #checkpointIntervalMs: number;
+  #lastCheckpointTime = Date.now();
   #diagnostics?: DiagnosticsSink;
   #rssLimit: number;
   #bufferPageLimit?: number;
@@ -98,6 +101,7 @@ export class BPlusTree {
     this.overflowManager = new OverflowManager(pageManager, bufferPool);
     this.meta = meta;
     this.#checkpointIntervalOps = walOptions?.checkpointIntervalOps ?? 0;
+    this.#checkpointIntervalMs = walOptions?.checkpointIntervalMs ?? 0;
     this.#diagnostics = diagnostics;
     this.#rssLimit = limits?.rssBytes ?? 100 * 1024 * 1024;
     this.#bufferPageLimit = limits?.bufferPages;
@@ -876,15 +880,20 @@ export class BPlusTree {
   }
 
   async #maybeCheckpoint(): Promise<void> {
-    if (this.#checkpointIntervalOps <= 0) {
+    this.#opsSinceCheckpoint += 1;
+    const opsDue =
+      this.#checkpointIntervalOps > 0 &&
+      this.#opsSinceCheckpoint >= this.#checkpointIntervalOps;
+    const timeDue =
+      this.#checkpointIntervalMs > 0 &&
+      Date.now() - this.#lastCheckpointTime >= this.#checkpointIntervalMs;
+    if (!opsDue && !timeDue) {
       return;
     }
-    this.#opsSinceCheckpoint += 1;
-    if (this.#opsSinceCheckpoint >= this.#checkpointIntervalOps) {
-      await this.bufferPool.flushAll();
-      await this.wal.checkpoint(this.pageManager);
-      this.#opsSinceCheckpoint = 0;
-    }
+    this.#opsSinceCheckpoint = 0;
+    this.#lastCheckpointTime = Date.now();
+    await this.bufferPool.flushAll();
+    await this.wal.checkpoint(this.pageManager);
   }
 
   #leafCellSerializedSize(cell: LeafCell): number {
