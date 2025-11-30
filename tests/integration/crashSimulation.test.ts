@@ -110,3 +110,25 @@ test(
   },
   { timeout: 120_000 },
 );
+
+test(
+  "overflow values survive crash and replay",
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ts-btree-crash-overflow-"));
+    const filePath = join(dir, "overflow.db");
+    const tree = await BPlusTree.open({ filePath });
+    const bigValue = Buffer.alloc(tree.pageManager.pageSize * 4, 0xcd);
+    await tree.set(5, bigValue);
+    await crashTree(tree);
+
+    const reopened = await BPlusTree.open({ filePath });
+    try {
+      const value = await reopened.get(5);
+      expect(value?.equals(bigValue)).toBeTrue();
+    } finally {
+      await reopened.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  { timeout: 120_000 },
+);

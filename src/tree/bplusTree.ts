@@ -7,10 +7,10 @@ import {
   MAGIC,
   KEY_SIZE_BYTES,
   PAGE_HEADER_SIZE,
-  OVERFLOW_HEADER_SIZE,
 } from "../constants.ts";
 import { BufferPool } from "../storage/bufferPool.ts";
 import { PageManager } from "../storage/pageManager.ts";
+import { OverflowManager } from "../storage/overflowManager.ts";
 import { WriteAheadLog } from "../storage/wal.ts";
 import {
   deserializeInternal,
@@ -56,6 +56,7 @@ export class BPlusTree {
   readonly pageManager: PageManager;
   readonly bufferPool: BufferPool;
   readonly wal: WriteAheadLog;
+  readonly overflowManager: OverflowManager;
   meta: MetaPage;
   #checkpointIntervalOps: number;
   #opsSinceCheckpoint = 0;
@@ -76,6 +77,7 @@ export class BPlusTree {
     this.pageManager = pageManager;
     this.bufferPool = bufferPool;
     this.wal = wal;
+    this.overflowManager = new OverflowManager(pageManager, bufferPool);
     this.meta = meta;
     this.#checkpointIntervalOps = walOptions?.checkpointIntervalOps ?? 0;
     this.#diagnostics = diagnostics;
@@ -172,7 +174,7 @@ export class BPlusTree {
         if (idx >= 0) {
           const [removed] = leaf.page.cells.splice(idx, 1);
           if (removed) {
-            await this.#freeOverflowChain(removed.overflowPage);
+            await this.overflowManager.freeChain(removed.overflowPage);
           }
           deleted = true;
           leafDirty = true;
@@ -585,12 +587,12 @@ export class BPlusTree {
     const { path, leaf } = await this.#traverseToLeaf(key, true);
     try {
       const existingIndex = leaf.page.cells.findIndex((cell) => cell.key === key);
-      if (existingIndex >= 0) {
-        const previous = leaf.page.cells[existingIndex];
-        if (previous) {
-          await this.#freeOverflowChain(previous.overflowPage);
-        }
-        leaf.page.cells[existingIndex] = await this.#prepareLeafCell(key, normalizedValue);
+        if (existingIndex >= 0) {
+          const previous = leaf.page.cells[existingIndex];
+          if (previous) {
+            await this.overflowManager.freeChain(previous.overflowPage);
+          }
+          leaf.page.cells[existingIndex] = await this.#prepareLeafCell(key, normalizedValue);
         this.#releaseLeaf(leaf, true);
         return;
       }
@@ -823,10 +825,8 @@ export class BPlusTree {
     const inlineLength = Math.min(value.length, inlineLimit);
     const inlineValue = Buffer.from(value.subarray(0, inlineLength));
     const remainder = value.subarray(inlineLength);
-    let overflowPage = 0;
-    if (remainder.length > 0) {
-      overflowPage = await this.#writeOverflowChain(remainder);
-    }
+    const overflowPage =
+      remainder.length > 0 ? await this.overflowManager.allocateChain(remainder) : 0;
     return {
       key,
       inlineValue,
@@ -839,80 +839,12 @@ export class BPlusTree {
     if (cell.overflowPage === 0) {
       return Buffer.from(cell.inlineValue);
     }
-    const buffer = Buffer.alloc(cell.valueLength);
-    cell.inlineValue.copy(buffer);
-    let offset = cell.inlineValue.length;
-    let cursor = cell.overflowPage;
-    while (cursor !== 0 && offset < cell.valueLength) {
-      const pageBuffer = await this.bufferPool.getPage(cursor);
-      if (pageBuffer.readUInt8(0) !== PageType.Overflow) {
-        this.bufferPool.unpin(cursor, false);
-        throw new Error(`Page ${cursor} is not an overflow page`);
-      }
-      const chunkLength = pageBuffer.readUInt32LE(8);
-      const copyLength = Math.min(chunkLength, cell.valueLength - offset);
-      pageBuffer.copy(
-        buffer,
-        offset,
-        OVERFLOW_HEADER_SIZE,
-        OVERFLOW_HEADER_SIZE + copyLength,
-      );
-      offset += copyLength;
-      const next = pageBuffer.readUInt32LE(4);
-      this.bufferPool.unpin(cursor, false);
-      cursor = next;
-    }
-    if (offset !== cell.valueLength) {
-      throw new Error(`Overflow chain truncated for key ${cell.key}`);
-    }
-    return buffer;
-  }
-
-  async #writeOverflowChain(data: Buffer): Promise<number> {
-    if (data.length === 0) {
-      return 0;
-    }
-    const payloadSize = this.pageManager.pageSize - OVERFLOW_HEADER_SIZE;
-    let head = 0;
-    let lastPage = 0;
-    let lastBuffer: Buffer | null = null;
-    let offset = 0;
-    while (offset < data.length) {
-      const pageNumber = await this.pageManager.allocatePage();
-      const buffer = await this.bufferPool.getPage(pageNumber);
-      buffer.fill(0);
-      buffer.writeUInt8(PageType.Overflow, 0);
-      buffer.writeUInt32LE(0, 4);
-      const chunkLength = Math.min(payloadSize, data.length - offset);
-      buffer.writeUInt32LE(chunkLength >>> 0, 8);
-      data.copy(buffer, OVERFLOW_HEADER_SIZE, offset, offset + chunkLength);
-      if (head === 0) {
-        head = pageNumber;
-      }
-      if (lastBuffer && lastPage !== 0) {
-        lastBuffer.writeUInt32LE(pageNumber, 4);
-        this.bufferPool.unpin(lastPage, true);
-      }
-      lastBuffer = buffer;
-      lastPage = pageNumber;
-      offset += chunkLength;
-    }
-    if (lastBuffer && lastPage !== 0) {
-      this.bufferPool.unpin(lastPage, true);
-    }
-    return head;
-  }
-
-  async #freeOverflowChain(pageNumber: number): Promise<void> {
-    let cursor = pageNumber;
-    while (cursor !== 0) {
-      const buffer = await this.bufferPool.getPage(cursor);
-      const next = buffer.readUInt32LE(4);
-      this.bufferPool.unpin(cursor, false);
-      this.bufferPool.dropPage(cursor);
-      await this.pageManager.freePage(cursor);
-      cursor = next;
-    }
+    const inline = Buffer.from(cell.inlineValue);
+    const remainder = await this.overflowManager.readChain(
+      cell.overflowPage,
+      cell.valueLength - inline.length,
+    );
+    return Buffer.concat([inline, remainder], cell.valueLength);
   }
 
   #maxInlineValueBytes(): number {

@@ -4,6 +4,12 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { BPlusTree } from "../../index.ts";
 
+function largeValue(i: number): Buffer {
+  const payload = Buffer.alloc(2048);
+  payload.writeUInt32LE(i, 0);
+  return payload;
+}
+
 test(
   "defragment reduces fragmentation and preserves data",
   async () => {
@@ -11,11 +17,9 @@ test(
     const filePath = join(dir, "frag.db");
     const tree = await BPlusTree.open({ filePath });
     try {
-      const total = 500;
+      const total = 750;
       for (let i = 0; i < total; i += 1) {
-        const value = Buffer.alloc(128);
-        value.writeUInt32LE(i, 0);
-        await tree.set(i, value);
+        await tree.set(i, largeValue(i));
       }
       for (let i = 0; i < total; i += 3) {
         await tree.delete(i);

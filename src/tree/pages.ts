@@ -4,6 +4,7 @@ import {
   MAX_LEAF_KEYS,
   PageType,
   PAGE_HEADER_SIZE,
+  OVERFLOW_HEADER_SIZE,
 } from "../constants.ts";
 import { bufferToBigInt, bigintToBuffer } from "../utils/codec.ts";
 
@@ -32,6 +33,13 @@ export interface InternalPage {
   rightSibling: number;
   leftChild: number;
   cells: InternalCell[];
+}
+
+export interface OverflowPage {
+  type: PageType.Overflow;
+  next: number;
+  length: number;
+  payload: Buffer;
 }
 
 export type BTreePage = LeafPage | InternalPage;
@@ -179,4 +187,40 @@ export function serializeInternal(page: InternalPage, target: Buffer): void {
     target.writeUInt32LE(cell.child, offset);
     offset += 4;
   }
+}
+
+export function serializeOverflow(page: OverflowPage, target: Buffer): void {
+  if (page.payload.length !== page.length) {
+    throw new Error("Overflow payload length mismatch");
+  }
+  if (page.length > target.length - OVERFLOW_HEADER_SIZE) {
+    throw new Error("Overflow payload exceeds page size");
+  }
+  target.fill(0);
+  target.writeUInt8(PageType.Overflow, 0);
+  target.writeUInt32LE(page.next, 4);
+  target.writeUInt32LE(page.length, 8);
+  page.payload.copy(target, OVERFLOW_HEADER_SIZE);
+}
+
+export function deserializeOverflow(buffer: Buffer): OverflowPage {
+  const type = buffer.readUInt8(0);
+  if (type !== PageType.Overflow) {
+    throw new Error("Page is not an overflow page");
+  }
+  const next = buffer.readUInt32LE(4);
+  const length = buffer.readUInt32LE(8);
+  if (length > buffer.length - OVERFLOW_HEADER_SIZE) {
+    throw new Error("Overflow page length exceeds capacity");
+  }
+  const payload = buffer.subarray(
+    OVERFLOW_HEADER_SIZE,
+    OVERFLOW_HEADER_SIZE + length,
+  );
+  return {
+    type: PageType.Overflow,
+    next,
+    length,
+    payload: Buffer.from(payload),
+  };
 }
