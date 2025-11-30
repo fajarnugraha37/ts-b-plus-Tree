@@ -69,6 +69,7 @@ Reads grab shared latches, hop to right siblings (B-link) if a high key was stal
 | Advanced IO tuning + vacuum | `examples/advancedOps.ts` |
 | Restore points | `examples/restorePoint.ts` |
 | Multi-file segmented pages | `tests/integration/multiFile.test.ts` |
+| Parallel range cursors | `tests/integration/parallelRange.test.ts` |
 
 ## Advanced features
 - **Segmented storage**: `io.segmentPages` spills pages into `*.segN` files automatically.
@@ -76,6 +77,7 @@ Reads grab shared latches, hop to right siblings (B-link) if a high key was stal
 - **Checkpoint cadence**: `walOptions.checkpointIntervalOps` & `checkpointIntervalMs`.
 - **Restore points (PITR)**: copy DB+WAL into a labeled directory and rewind anytime.
 - **WAL compression**: `walOptions.compressFrames` shrinks log size ~40% in tests.
+- **Parallel range cursors**: `createRangeCursor()` lets you spawn multiple readers that walk disjoint key ranges concurrently.
 
 ## Cookbook
 1. **Enable segmented storage & WAL compression**:
@@ -95,6 +97,26 @@ Reads grab shared latches, hop to right siblings (B-link) if a high key was stal
    await restoreFromPoint("./restorePoints/pre-migration", "./db-rolled-back.db");
    ```
 4. **Watch background vacuum in action**: run `examples/advancedOps.ts` and tail the logs; you’ll see vacuum batches trimming free pages.
+5. **Run parallel range scans**:
+   ```ts
+   const partitions = [0, 250, 500, 750];
+   const cursors = partitions.map((start, index) =>
+     tree.createRangeCursor(start, Math.min(start + 249, 999)),
+   );
+   const readers = cursors.map(async (cursor) => {
+     const rows = [];
+     while (true) {
+       const row = await cursor.next();
+       if (!row) {
+         break;
+       }
+       rows.push(row);
+     }
+     await cursor.close();
+     return rows;
+   });
+   await Promise.all(readers);
+   ```
 
 ## Performance benchmarks (bun test / local NVMe)
 | Workload | 100K records | 1M records |
@@ -115,7 +137,7 @@ interface BPlusTreeOptions {
   maintenance?: { backgroundVacuum?: boolean; vacuumOptions?: { intervalMs?: number; batchSize?: number; } };
 }
 ```
-Main methods: `get`, `set`, `delete`, `range`, `keys`, `values`, `defragment`, `vacuum`, `consistencyCheck`, `createRestorePoint`, `restoreFromPoint`.
+Main methods: `get`, `set`, `delete`, `range`, `createRangeCursor`, `keys`, `values`, `defragment`, `vacuum`, `consistencyCheck`, `createRestorePoint`, `restoreFromPoint`.
 
 ## Performance & reliability status
 - ✔️ Multi-level splits/merges, segmented storage, WAL replay, background vacuum.

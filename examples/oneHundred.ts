@@ -23,6 +23,7 @@ async function main() {
 
   try {
     console.log("loading 1000k keys with mixed payloads...");
+    let lastTime = Date.now();
     for (let i = 0; i < 1_000_000; i += 1) {
       const payload = i % 10 === 0 ? Buffer.alloc(4096, i & 0xff) : Buffer.from(`value-${i}`);
       await tree.set(i, payload);
@@ -31,6 +32,13 @@ async function main() {
         const heapTotalMB = (memoryUsage.heapTotal / (1024 * 1024)).toFixed(2);
         const rssMB = (memoryUsage.rss / (1024 * 1024)).toFixed(2);
         console.log(`  inserted ${i} keys: ${heapTotalMB} MB heap used and ${rssMB} MB RSS`);
+
+        const currentTime = Date.now();
+        if (i > 0) {
+          const duration = currentTime - lastTime;
+          console.log(`  -> Inserted last 10000 keys in ${duration} ms, total ${i}\n`);
+        }
+        lastTime = currentTime;
       }
     }
 

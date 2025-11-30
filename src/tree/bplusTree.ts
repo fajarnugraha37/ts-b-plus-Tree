@@ -37,6 +37,21 @@ import { rebalanceInternalPath } from "./internalRebalancer.ts";
 import type { DiagnosticsSink } from "../diagnostics.ts";
 import { AsyncRWLock } from "../utils/locks.ts";
 
+export interface RangeCursor {
+  next(): Promise<{ key: Buffer; value: Buffer } | null>;
+  close(): Promise<void>;
+}
+
+type RangeCursorState = {
+  startKey: bigint;
+  endKey: bigint;
+  leaf: LoadedPage<LeafPage> | null;
+  release: (() => void) | null;
+  index: number;
+  done: boolean;
+  firstLeaf: boolean;
+};
+
 interface BPlusTreeOptions {
   filePath: string;
   walPath?: string;
@@ -324,6 +339,29 @@ export class BPlusTree {
         yield row.value as unknown as T;
       }
     }
+  }
+
+  createRangeCursor(startInput: KeyInput, endInput: KeyInput): RangeCursor {
+    const startKey = bufferToBigInt(normalizeKeyInput(startInput));
+    const endKey = bufferToBigInt(normalizeKeyInput(endInput));
+    if (endKey < startKey) {
+      throw new Error("end key must be >= start key");
+    }
+    const state: RangeCursorState = {
+      startKey,
+      endKey,
+      leaf: null,
+      release: null,
+      index: 0,
+      done: false,
+      firstLeaf: true,
+    };
+    return {
+      next: async () => this.#cursorNext(state),
+      close: async () => {
+        await this.#cursorClose(state);
+      },
+    };
   }
 
   async defragment(): Promise<void> {
@@ -1011,6 +1049,84 @@ export class BPlusTree {
         snapshot,
       );
     }
+  }
+
+  async #cursorNext(
+    state: RangeCursorState,
+  ): Promise<{ key: Buffer; value: Buffer } | null> {
+    if (state.done) {
+      return null;
+    }
+    await this.#ensureCursorLeaf(state);
+    while (!state.done && state.leaf) {
+      if (state.index >= state.leaf.page.cells.length) {
+        if (!state.leaf.page.rightSibling) {
+          await this.#cursorClose(state);
+          return null;
+        }
+        await this.#moveCursorToSibling(state, state.leaf.page.rightSibling);
+        continue;
+      }
+      const cell = state.leaf.page.cells[state.index];
+      if (!cell) {
+        state.index += 1;
+        continue;
+      }
+      state.index += 1;
+      if (state.firstLeaf && cell.key < state.startKey) {
+        continue;
+      }
+      state.firstLeaf = false;
+      if (cell.key > state.endKey) {
+        await this.#cursorClose(state);
+        return null;
+      }
+      const value = await this.#materializeCellValue(cell);
+      return {
+        key: Buffer.from(normalizeKeyInput(cell.key)),
+        value,
+      };
+    }
+    return null;
+  }
+
+  async #cursorClose(state: RangeCursorState): Promise<void> {
+    if (state.leaf) {
+      this.#releaseLeaf(state.leaf, false);
+      state.leaf = null;
+    }
+    if (state.release) {
+      state.release();
+      state.release = null;
+    }
+    state.done = true;
+  }
+
+  async #ensureCursorLeaf(state: RangeCursorState): Promise<void> {
+    if (state.leaf || state.done) {
+      return;
+    }
+    const { leaf, release } = await this.#findLeafForKey(state.startKey);
+    state.leaf = leaf;
+    state.release = release;
+    state.index = 0;
+    state.firstLeaf = true;
+  }
+
+  async #moveCursorToSibling(
+    state: RangeCursorState,
+    siblingPageNumber: number,
+  ): Promise<void> {
+    const nextRelease = await this.latchManager.acquireShared(siblingPageNumber);
+    const nextLeaf = await this.#loadLeaf(siblingPageNumber);
+    if (state.leaf) {
+      this.#releaseLeaf(state.leaf, false);
+      state.release?.();
+    }
+    state.leaf = nextLeaf;
+    state.release = nextRelease;
+    state.index = 0;
+    state.firstLeaf = false;
   }
 
   #startBackgroundVacuum(): void {
